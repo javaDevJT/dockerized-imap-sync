@@ -1,6 +1,6 @@
 # dockerized-imap-sync
 
-This container reproduces the behavior of the Kubernetes `CronJob` in `imap-cron.yml` by running `imapsync` every 3 minutes inside a standalone Docker container.
+This container reproduces the behavior of the Kubernetes `CronJob` in `imap-cron.yml` by running `imapsync` inside a standalone Docker container with a minimum 3-minute interval between run starts.
 
 ## Runtime environment variables
 
@@ -42,9 +42,11 @@ docker run -d \
 
 ## Behavior
 
-- Runs `imapsync` every 3 minutes using `cron`
+- Runs `imapsync`, then waits until at least 3 minutes have passed since the previous run started
+- Starts the next run immediately if the previous sync took longer than 3 minutes
 - Uses the same sync flags as the original Kubernetes job
 - Fails fast if any required runtime variables are missing
+- Exits the container on sync failure so an external restart policy can restart it
 
 ## GitHub Actions
 

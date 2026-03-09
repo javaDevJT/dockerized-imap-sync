@@ -2,10 +2,6 @@ FROM gilleslamiral/imapsync:latest
 
 USER root
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends cron \
-    && rm -rf /var/lib/apt/lists/*
-
 ENV IMAP1_HOST="imap.mail.yahoo.com" \
     IMAP1_USER="" \
     IMAP1_PASSWORD="" \
@@ -41,11 +37,21 @@ RUN printf '%s\n' \
     && chmod +x /usr/local/bin/run-imapsync
 
 RUN printf '%s\n' \
-    'SHELL=/bin/sh' \
-    'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' \
-    '*/3 * * * * root /usr/local/bin/run-imapsync >> /var/log/imapsync.log 2>&1' \
-    > /etc/cron.d/imapsync \
-    && chmod 0644 /etc/cron.d/imapsync \
-    && touch /var/log/imapsync.log
+    '#!/bin/sh' \
+    'set -eu' \
+    '' \
+    'while true; do' \
+    '  start="$(date +%s)"' \
+    '  /usr/local/bin/run-imapsync' \
+    '  end="$(date +%s)"' \
+    '  elapsed=$((end - start))' \
+    '  sleep_for=$((180 - elapsed))' \
+    '' \
+    '  if [ "$sleep_for" -gt 0 ]; then' \
+    '    sleep "$sleep_for"' \
+    '  fi' \
+    'done' \
+    > /usr/local/bin/run-loop \
+    && chmod +x /usr/local/bin/run-loop
 
-CMD ["cron", "-f"]
+CMD ["/usr/local/bin/run-loop"]
