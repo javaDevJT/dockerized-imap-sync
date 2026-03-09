@@ -45,3 +45,16 @@ docker run -d \
 - Runs `imapsync` every 3 minutes using `cron`
 - Uses the same sync flags as the original Kubernetes job
 - Fails fast if any required runtime variables are missing
+
+## GitHub Actions
+
+The repository includes a workflow at `.github/workflows/build-image.yml` that builds and pushes the image to GHCR on every push to `main` and on manual dispatch.
+
+Add this repository secret before using the workflow:
+
+- `GHCR_PAT`: a GitHub personal access token with permission to push packages to GHCR
+
+The workflow publishes:
+
+- `ghcr.io/<owner>/dockerized-imap-sync:latest`
+- `ghcr.io/<owner>/dockerized-imap-sync:sha-<commit>`
