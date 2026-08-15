@@ -31,7 +31,7 @@ RUN printf '%s\n' \
     '  --automap \' \
     '  --nofoldersizesatend \' \
     '  --nofoldersizes \' \
-    '  --compress1 \' \
+    '  --nocompress1 \' \
     '  --nocompress2' \
     > /usr/local/bin/run-imapsync \
     && chmod +x /usr/local/bin/run-imapsync
