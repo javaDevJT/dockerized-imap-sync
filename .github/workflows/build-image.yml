@@ -8,7 +8,7 @@ on:
 
 jobs:
   docker:
-    runs-on: truenas-dockerized-imap-sync
+    runs-on: truenas-dockerized-imap-sync-storage-8g
     permissions:
       contents: read
       packages: write
@@ -48,11 +48,16 @@ jobs:
             type=raw,value=latest
             type=sha
 
+      - name: Prepare disk build cache
+        id: ci_disk_cache_1
+        run: ci-cache "truenas-7586cd64b4ecc22d"
       - name: Build and push image
         uses: docker/build-push-action@v6
         with:
-          cache-from: type=gha,version=2,scope=truenas-7586cd64b4ecc22d
-          cache-to: type=gha,version=2,mode=max,scope=truenas-7586cd64b4ecc22d
+          cache-from: |
+            type=local,src=${{ steps.ci_disk_cache_1.outputs.from }}
+            type=gha,version=2,scope=truenas-7586cd64b4ecc22d
+          cache-to: ${{ steps.ci_disk_cache_1.outputs.to && format('type=local,dest={0},mode=max,ignore-error=true', steps.ci_disk_cache_1.outputs.to) || '' }}
           context: .
           push: true
           tags: ${{ steps.meta.outputs.tags }}
