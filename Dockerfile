@@ -1,6 +1,8 @@
 # syntax=docker/dockerfile:1
 
-FROM alpine:3.24 AS imapsync-source
+# This official edge base supplies patched Perl 5.44 and matching XS modules.
+ARG ALPINE_IMAGE=alpine:edge@sha256:020dfcbaaf4cc1078bf2d9c7ba31a8466e334061dcd2f248001d68f79e52c000
+FROM ${ALPINE_IMAGE} AS imapsync-source
 
 ADD --checksum=sha256:34b7ed8e0948b3f9ccac0318333b726a7263e134784eee6eab429639808b7822 \
     https://github.com/imapsync/imapsync/archive/93654c6025ff7814f983ab74dd300f9bed9282d9.tar.gz \
@@ -8,7 +10,7 @@ ADD --checksum=sha256:34b7ed8e0948b3f9ccac0318333b726a7263e134784eee6eab42963980
 RUN tar -xzf /tmp/imapsync.tar.gz -C /tmp \
     && install -Dm755 /tmp/imapsync-93654c6025ff7814f983ab74dd300f9bed9282d9/imapsync /usr/local/bin/imapsync
 
-FROM alpine:3.24 AS zlib-build
+FROM ${ALPINE_IMAGE} AS zlib-build
 
 RUN apk add --no-cache alpine-sdk
 WORKDIR /src/zlib-ng-compat
@@ -18,7 +20,7 @@ RUN abuild-keygen -a -n \
     && REPODEST=/packages abuild -F -r \
     && cp /packages/*/*/zlib-ng-compat-*.apk /zlib-ng-compat.apk
 
-FROM alpine:3.24
+FROM ${ALPINE_IMAGE}
 
 COPY --from=zlib-build /etc/apk/keys/ /etc/apk/keys/
 COPY --from=zlib-build /zlib-ng-compat.apk /tmp/zlib-ng-compat.apk
@@ -50,7 +52,8 @@ RUN apk add --no-cache --force-non-repository /tmp/zlib-ng-compat.apk \
     && ! apk info | grep -qx zlib
 
 COPY --from=imapsync-source /usr/local/bin/imapsync /usr/local/bin/imapsync
-RUN perl -MCompress::Zlib -e 'die "compression round trip failed" unless Compress::Zlib::uncompress(Compress::Zlib::compress("imapsync")) eq "imapsync"' \
+RUN perl -e 'die "Perl 5.44 or newer required\n" unless $^V ge v5.44.0' \
+    && perl -MCompress::Zlib -e 'die "compression round trip failed" unless Compress::Zlib::uncompress(Compress::Zlib::compress("imapsync")) eq "imapsync"' \
     && imapsync --version \
     && imapsync --help >/dev/null
 

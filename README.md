@@ -22,9 +22,12 @@ You should still pass all variables explicitly when running the container.
 
 ## Build
 
-The image uses Alpine 3.24 and checksum-pinned imapsync 2.314. A build stage
-packages zlib-ng 2.3.3 with the compatible zlib ABI to replace the vulnerable
-zlib library. Build tools and signing private keys remain in the build stage.
+The image uses a digest-pinned Alpine edge base image with Perl 5.44 and
+checksum-pinned imapsync 2.314. Edge supplies the patched Perl release and
+matching XS modules; the stable Alpine 3.24 package still fails the scan gate.
+A build stage packages zlib-ng 2.3.3 with the compatible zlib ABI to replace
+the vulnerable zlib library. Build tools and signing private keys remain in
+the build stage.
 The runtime retains APK package metadata for SBOM and vulnerability scanning.
 Builds check compression round-trip behavior and imapsync's version and help.
 Upstream's `--tests` includes remote connections, so it is not run during builds.
