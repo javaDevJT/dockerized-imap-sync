@@ -33,6 +33,7 @@ Resolved on October 4, 2026 from the live native spawn catalog: `gpt-6-luna`, re
 - Package zlib-ng 2.3.3 with its supported zlib ABI and real APK name/version. Its `gzwrite.c` lacks the affected `gz_vacate` function; source archive checksum is pinned in APKBUILD. No scanner exclusions or severity/fix filters were added.
 - The final image receives the signed replacement APK and its public key; private signing keys and compilers remain in the build stage.
 - Independent review caught that the generated public key must be installed into `/etc/apk/keys`. The root builder copies only `*.rsa.pub` there explicitly, avoiding a dependency on a privilege helper and enabling final APK signature verification.
+- The package assertion checks the exact installed package name. `apk info --exists zlib` would also match the replacement's virtual compatibility capability and cannot distinguish it from the original implementation.
 - Local mock validation passed: six required variables, exact quoted arguments, sync failure propagation, 180-second interval and overrun behavior. No email accounts or servers were contacted.
 - Despite its help text, upstream's `--tests` has active remote TLS/IMAP probes. Build smoke checks therefore use only `--version`, `--help`, and a local compression round trip. The remote test suite is not run.
 - The user explicitly authorized updating this repository's shared TrueNAS runner capacity profile and redeploying the runner.

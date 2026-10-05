@@ -46,7 +46,8 @@ RUN apk add --no-cache /tmp/zlib-ng-compat.apk \
         perl-test-simple \
         perl-unicode-string \
     && rm /tmp/zlib-ng-compat.apk \
-    && ! apk info --exists zlib
+    && apk info --exists zlib-ng-compat \
+    && ! apk info | grep -qx zlib
 
 COPY --from=imapsync-source /usr/local/bin/imapsync /usr/local/bin/imapsync
 RUN perl -MCompress::Zlib -e 'die "compression round trip failed" unless Compress::Zlib::uncompress(Compress::Zlib::compress("imapsync")) eq "imapsync"' \
