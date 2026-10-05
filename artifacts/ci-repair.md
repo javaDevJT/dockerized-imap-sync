@@ -2,6 +2,17 @@
 
 Objective: fix the failing vulnerability gate and BuildKit storage checks, validate, commit, and push.
 
+## Verified TrueNAS deployment on October 5, 2026
+
+The user explicitly authorized deploying the newly verified image to the existing TrueNAS IMAP app and verifying it. The existing app is catalog-managed, so primary used the TrueNAS advisor's scoped `app.pull_images` lifecycle operation with redeployment; its configured image reference remains `ghcr.io/javadevjt/dockerized-imap-sync:latest`.
+
+- App: `imap-sync` on `192.168.0.2:8443`. TrueNAS job **232326** completed with **SUCCESS**, and the app returned to **RUNNING**. Container `846be918b39d14d17ee07e2959059aeffc5d0691319a7e41e0c6ea377d1ce0e9` replaced `4fb09bf453cc827373f3d9884a72acc23bbfb4f7d8b3d5e6b74289a44bdb0f0c`.
+- Image: TrueNAS reports `latest` at **`sha256:c336061ead38563770319f5d2a4d8d73f407f904a09dcce97526df060532cd9c`**, exactly the published and scanned digest. Its local image ID is `sha256:87d95198d2c87beb0315fc3c1b53da14b011b5ea5c3860210ea52f9d5b6d2173`. The previous `sha256:a478cebbc0f64c953415b52b6611d442ace4a5dcba2eb1d7d739a11d545efd10` image remains cached; no images or storage were deleted.
+- Preservation: primary compared the complete live app configuration before and after deployment in memory and confirmed deep equality. Credentials, command/entrypoint overrides, environment, restart policy, networks, and storage configuration were preserved. The app exposes no ports or volume mounts before or after this refresh.
+- Functional verification: the new container logs identify **imapsync 2.314**, successful logins to both configured hosts, completed statistics for all **17 folders**, **Detected 0 errors**, and exit value **0 (EX_OK)**. The first sync started at **13:31:26 UTC** and ended at **13:33:13 UTC** on October 5, 2026. The next invocation started at **13:34:26 UTC**, confirming the unchanged **180-second** start-to-start cadence in the same running container.
+- Privacy: raw logs and configuration were processed only in memory; no account credentials, tokens, or message contents were printed or persisted in evidence. Verification observed the app's normal authorized sync, without invoking additional live IMAP/OAuth test suites.
+- The bounded read-only worker's source-marker and masking audit was accepted and native capacity released. It made no app/API calls or file changes. Requested retained configuration was gpt-6-luna, max; independent backend telemetry and service-tier controls are unavailable. Primary independently checked actual runtime, digest, configuration preservation, and safe derived log summaries.
+
 ## Verified result on October 5, 2026
 
 Functional commit: `994f35fa42b07b4ffd8b37f2732882ff81d0e100` on `main`. [CI run 37314347417](https://github.com/javaDevJT/dockerized-imap-sync/actions/runs/37314347417) completed successfully, including the runtime build, vulnerability gate, storage gate, and release publication.
@@ -10,7 +21,7 @@ Functional commit: `994f35fa42b07b4ffd8b37f2732882ff81d0e100` on `main`. [CI run
 - Storage: **2,147,483,648 bytes (2 GiB)** allocated; valid measured peak **1,845,669,888 bytes (1.719 GiB)**, **85.95 percent** utilization, 3,869 samples at 100 ms. The build stayed within capacity and passed the unchanged requirement `5 × peak > 4 × requested`. Remaining measured capacity: 301,813,760 bytes. Combining both APK builds into one layer eliminated the duplicate compiler-stage snapshot.
 - Release: `ghcr.io/javadevjt/dockerized-imap-sync:latest` and `:sha-994f35f` both resolve to **`sha256:c336061ead38563770319f5d2a4d8d73f407f904a09dcce97526df060532cd9c`**. Primary independently read both authenticated registry manifests and checked each response-body SHA-256 against the registry header and the scanned digest. Credentials remained in process memory and were not printed or persisted.
 - Runtime: CI verified signed APK installation, the libz SONAME, Bash ownership of `/bin/sh`, local POSIX arithmetic/date/sleep, procps RSS output, the compression round trip, and imapsync version/help. Local mock checks verified all six required variables, quoted credentials, unchanged destructive sync flags, failure behavior, and the 180-second scheduling interval. No live IMAP or OAuth probes were performed.
-- Shared runner: the authorized TrueNAS profile update remains deployed with imap capacities `[2, 8]` GiB; this workflow requests the 2 GiB label. No imap application service deployment was performed. All delegated workers completed and released native capacity.
+- Shared runner: the authorized TrueNAS profile update remains deployed with imap capacities `[2, 8]` GiB; this workflow requests the 2 GiB label. This CI phase did not deploy the imap application; the subsequent authorized deployment is recorded above. All delegated workers completed and released native capacity.
 
 Final downloaded evidence is under `/private/tmp/imap-final-37314347417/`; the durable conclusions, source identifiers, and image digest are recorded here. This validation-note update changes documentation only.
 
