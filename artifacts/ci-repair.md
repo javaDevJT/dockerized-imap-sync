@@ -4,6 +4,8 @@ Objective: fix the failing vulnerability gate and BuildKit storage checks, valid
 
 ## Continued validation on October 5, 2026
 
+- Run `37313749834` successfully built both signed APKs in the combined layer, then exposed duplicate `cmd:sh` provider metadata: abuild automatically emits a versioned command provider for `/bin/sh`. The authored package now explicitly provides only `/bin/sh`, retains abuild's generated `cmd:sh`, and increments its package release to 1. Its 1,425,051,648-byte storage peak is incomplete because the final runtime installation failed; it is not used to resize the runner.
+
 - Run `37313196709` failed while copying the completed compiler-stage parent for the separate shell-package build: `copy_file_range failed: no space left on device`. Both signed packages now build within one layer from one packaging-source copy, avoiding that duplicate compiler snapshot. The 2 GiB profile will be validated again.
 - Storage worker reactivated for a bounded read-only analysis of run `37313196709`'s storage artifact (requested native configuration retained: gpt-6-luna, max; separate backend telemetry and service-tier controls unavailable). Outcome: distinguish measured BuildKit usage from capacity exhaustion. Root owns all implementation, runner operations, commits, and pushes; worker edits none of these. Release on concise artifact-backed handoff.
 

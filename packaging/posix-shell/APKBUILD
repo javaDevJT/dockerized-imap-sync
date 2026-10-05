@@ -1,13 +1,13 @@
 # Own the POSIX shell path without requiring BusyBox's fallback applets.
 pkgname=posix-shell
 pkgver=1.0.0
-pkgrel=0
+pkgrel=1
 pkgdesc="POSIX shell entrypoint provided by Bash"
 url="https://www.gnu.org/software/bash/"
 arch="noarch"
 license="MIT"
 depends="bash"
-provides="/bin/sh cmd:sh"
+provides="/bin/sh"
 replaces="busybox-binsh bash-binsh"
 options="!check"
 
