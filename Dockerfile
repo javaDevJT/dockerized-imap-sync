@@ -14,15 +14,13 @@ FROM ${ALPINE_IMAGE} AS zlib-build
 
 RUN apk add --no-cache alpine-sdk
 WORKDIR /src/zlib-ng-compat
-COPY packaging/zlib-ng-compat/APKBUILD ./APKBUILD
+COPY packaging/ /src/
 RUN abuild-keygen -a -n \
     && cp /root/.config/abuild/*.rsa.pub /etc/apk/keys/ \
     && REPODEST=/packages abuild -F -r \
-    && cp /packages/*/*/zlib-ng-compat-*.apk /zlib-ng-compat.apk
-
-WORKDIR /src/posix-shell
-COPY packaging/posix-shell/APKBUILD ./APKBUILD
-RUN REPODEST=/packages abuild -F -r \
+    && cp /packages/*/*/zlib-ng-compat-*.apk /zlib-ng-compat.apk \
+    && cd /src/posix-shell \
+    && REPODEST=/packages abuild -F -r \
     && cp /packages/*/*/posix-shell-*.apk /posix-shell.apk
 
 FROM ${ALPINE_IMAGE}

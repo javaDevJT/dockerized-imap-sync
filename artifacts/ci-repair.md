@@ -4,6 +4,9 @@ Objective: fix the failing vulnerability gate and BuildKit storage checks, valid
 
 ## Continued validation on October 5, 2026
 
+- Run `37313196709` failed while copying the completed compiler-stage parent for the separate shell-package build: `copy_file_range failed: no space left on device`. Both signed packages now build within one layer from one packaging-source copy, avoiding that duplicate compiler snapshot. The 2 GiB profile will be validated again.
+- Storage worker reactivated for a bounded read-only analysis of run `37313196709`'s storage artifact (requested native configuration retained: gpt-6-luna, max; separate backend telemetry and service-tier controls unavailable). Outcome: distinguish measured BuildKit usage from capacity exhaustion. Root owns all implementation, runner operations, commits, and pushes; worker edits none of these. Release on concise artifact-backed handoff.
+
 - The BusyBox helper audit is complete and the worker released. Normal password sync invokes `ps -o rss -p ...` for startup and final memory statistics (pinned imapsync source lines 1417, 16653, and 18838). Alpine edge's `procps-ng` provides `ps` and `sysctl`; it is included with a safe local RSS-format check. GNU coreutils supplies the wrapper's `date` and `sleep`. No live IMAP or OAuth probes were run.
 - The workflow now requests the deployed 2 GiB TrueNAS profile. Local wrapper mocks, package shell syntax, actionlint with the custom runner label, and whitespace checks pass. The next CI run must prove signed shell-package installation, BusyBox removal, zero High/Critical findings, and actual storage capacity and efficiency.
 
