@@ -2,7 +2,21 @@
 
 Objective: fix the failing vulnerability gate and BuildKit storage checks, validate, commit, and push.
 
+## Verified result on October 5, 2026
+
+Functional commit: `994f35fa42b07b4ffd8b37f2732882ff81d0e100` on `main`. [CI run 37314347417](https://github.com/javaDevJT/dockerized-imap-sync/actions/runs/37314347417) completed successfully, including the runtime build, vulnerability gate, storage gate, and release publication.
+
+- Security: **0 High and 0 Critical** findings; 13 Medium findings remain. No vulnerability exclusions, fixed-only filtering, or package-identity overrides were introduced. The downloaded SBOM confirms Perl `5.44.0-r0`, zlib-ng-compat `2.3.3-r2`, posix-shell `1.0.0-r1`, Bash `5.3.9-r2`, coreutils `9.11-r1`, and procps-ng `4.0.7-r1`. No original zlib, BusyBox packages, ssl_client, or build-tool packages are present.
+- Storage: **2,147,483,648 bytes (2 GiB)** allocated; valid measured peak **1,845,669,888 bytes (1.719 GiB)**, **85.95 percent** utilization, 3,869 samples at 100 ms. The build stayed within capacity and passed the unchanged requirement `5 × peak > 4 × requested`. Remaining measured capacity: 301,813,760 bytes. Combining both APK builds into one layer eliminated the duplicate compiler-stage snapshot.
+- Release: `ghcr.io/javadevjt/dockerized-imap-sync:latest` and `:sha-994f35f` both resolve to **`sha256:c336061ead38563770319f5d2a4d8d73f407f904a09dcce97526df060532cd9c`**. Primary independently read both authenticated registry manifests and checked each response-body SHA-256 against the registry header and the scanned digest. Credentials remained in process memory and were not printed or persisted.
+- Runtime: CI verified signed APK installation, the libz SONAME, Bash ownership of `/bin/sh`, local POSIX arithmetic/date/sleep, procps RSS output, the compression round trip, and imapsync version/help. Local mock checks verified all six required variables, quoted credentials, unchanged destructive sync flags, failure behavior, and the 180-second scheduling interval. No live IMAP or OAuth probes were performed.
+- Shared runner: the authorized TrueNAS profile update remains deployed with imap capacities `[2, 8]` GiB; this workflow requests the 2 GiB label. No imap application service deployment was performed. All delegated workers completed and released native capacity.
+
+Final downloaded evidence is under `/private/tmp/imap-final-37314347417/`; the durable conclusions, source identifiers, and image digest are recorded here. This validation-note update changes documentation only.
+
 ## Continued validation on October 5, 2026
+
+- Storage worker's focused handoff accepted and native capacity released. Run `37313196709` recorded a valid 2,110,590,976-byte peak across 966 samples at 100 ms, 98.28 percent of the 2 GiB capacity, with only 35.18 MiB remaining. The underuse gate passed, but the subsequent compiler-parent copy exhausted actual capacity. This supports removing the duplicate build layer; it does not establish the revised image's final capacity requirement. Primary checked the artifact fields and retains final sizing responsibility.
 
 - Run `37313749834` successfully built both signed APKs in the combined layer, then exposed duplicate `cmd:sh` provider metadata: abuild automatically emits a versioned command provider for `/bin/sh`. The authored package now explicitly provides only `/bin/sh`, retains abuild's generated `cmd:sh`, and increments its package release to 1. Its 1,425,051,648-byte storage peak is incomplete because the final runtime installation failed; it is not used to resize the runner.
 
