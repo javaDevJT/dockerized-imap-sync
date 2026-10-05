@@ -20,17 +20,25 @@ RUN abuild-keygen -a -n \
     && REPODEST=/packages abuild -F -r \
     && cp /packages/*/*/zlib-ng-compat-*.apk /zlib-ng-compat.apk
 
+WORKDIR /src/posix-shell
+COPY packaging/posix-shell/APKBUILD ./APKBUILD
+RUN REPODEST=/packages abuild -F -r \
+    && cp /packages/*/*/posix-shell-*.apk /posix-shell.apk
+
 FROM ${ALPINE_IMAGE}
 
 COPY --from=zlib-build /etc/apk/keys/ /etc/apk/keys/
 COPY --from=zlib-build /zlib-ng-compat.apk /tmp/zlib-ng-compat.apk
+COPY --from=zlib-build /posix-shell.apk /tmp/posix-shell.apk
 # zlib-ng supplies the same libz ABI without zlib's vulnerable gz_vacate code.
 # Keep the replacement as an APK so the SBOM records its real name and version.
 RUN apk add --no-cache --force-non-repository /tmp/zlib-ng-compat.apk \
     && apk del zlib \
     && apk upgrade --no-cache \
     && apk add --no-cache \
+        bash \
         ca-certificates \
+        coreutils \
         perl \
         perl-digest-hmac \
         perl-encode-imaputf7 \
@@ -47,12 +55,18 @@ RUN apk add --no-cache --force-non-repository /tmp/zlib-ng-compat.apk \
         perl-term-readkey \
         perl-test-simple \
         perl-unicode-string \
-    && rm /tmp/zlib-ng-compat.apk \
+        procps-ng \
+    && apk add --no-cache --force-non-repository /tmp/posix-shell.apk \
+    && apk del busybox busybox-binsh ssl_client \
+    && rm /tmp/zlib-ng-compat.apk /tmp/posix-shell.apk \
     && apk info --exists zlib-ng-compat \
-    && ! apk info | grep -qx zlib
+    && apk info | perl -ne 'die "unexpected zlib or BusyBox package\n" if /^zlib$/ || /^busybox(?:-|$)/ || /^ssl_client$/' \
+    && test "$(readlink /bin/sh)" = /bin/bash \
+    && /bin/sh -ec 'test "$((180 - 1))" -eq 179; date +%s >/dev/null; sleep 0'
 
 COPY --from=imapsync-source /usr/local/bin/imapsync /usr/local/bin/imapsync
 RUN perl -e 'die "Perl 5.44 or newer required\n" unless $^V ge v5.44.0' \
+    && perl -e 'my @rss = qx{ps -o rss -p $$}; shift @rss; die "ps RSS check failed\n" unless @rss == 1 && $rss[0] =~ /^\s*\d+\s*$/' \
     && perl -MCompress::Zlib -e 'die "compression round trip failed" unless Compress::Zlib::uncompress(Compress::Zlib::compress("imapsync")) eq "imapsync"' \
     && imapsync --version \
     && imapsync --help >/dev/null

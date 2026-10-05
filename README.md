@@ -29,6 +29,8 @@ A build stage packages zlib-ng 2.3.3 with the compatible zlib ABI to replace
 the vulnerable zlib library. Build tools and signing private keys remain in
 the build stage.
 The runtime retains APK package metadata for SBOM and vulnerability scanning.
+Bash and GNU core utilities provide the shell and scheduling commands; BusyBox
+is removed from the runtime. A signed shell-provider package owns `/bin/sh`.
 Builds check compression round-trip behavior and imapsync's version and help.
 Upstream's `--tests` includes remote connections, so it is not run during builds.
 
