@@ -1,7 +1,7 @@
 # zlib-ng's supported zlib ABI replaces the affected upstream zlib library.
 pkgname=zlib-ng-compat
 pkgver=2.3.3
-pkgrel=1
+pkgrel=2
 pkgdesc="zlib-ng built with the zlib-compatible ABI"
 url="https://github.com/zlib-ng/zlib-ng"
 arch="all"
@@ -12,8 +12,7 @@ source="zlib-ng-$pkgver.tar.gz::https://github.com/zlib-ng/zlib-ng/archive/refs/
 builddir="$srcdir/zlib-ng-$pkgver"
 
 build() {
-	# abuild requires a numeric file version; the ELF SONAME remains libz.so.1.
-	SHAREDLIBV=libz.so.1.3.1 ./configure --zlib-compat --prefix=/usr --libdir=/usr/lib
+	./configure --zlib-compat --prefix=/usr --libdir=/usr/lib
 	make -j2
 }
 
@@ -23,6 +22,11 @@ check() {
 
 package() {
 	make DESTDIR="$pkgdir" install
+	# abuild requires a numeric file version; preserve the actual libz.so.1 ABI.
+	mv "$pkgdir/usr/lib/libz.so.1.3.1.zlib-ng" "$pkgdir/usr/lib/libz.so.1.3.1"
+	ln -sf libz.so.1.3.1 "$pkgdir/usr/lib/libz.so.1"
+	ln -sf libz.so.1 "$pkgdir/usr/lib/libz.so"
+	readelf -d "$pkgdir/usr/lib/libz.so.1.3.1" | grep -q 'Library soname: \[libz\.so\.1\]'
 	rm -rf "$pkgdir/usr/include" "$pkgdir/usr/lib/pkgconfig" "$pkgdir/usr/share"
 	rm -f "$pkgdir/usr/lib/libz.a"
 }
