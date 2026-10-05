@@ -24,7 +24,7 @@ COPY --from=zlib-build /etc/apk/keys/ /etc/apk/keys/
 COPY --from=zlib-build /zlib-ng-compat.apk /tmp/zlib-ng-compat.apk
 # zlib-ng supplies the same libz ABI without zlib's vulnerable gz_vacate code.
 # Keep the replacement as an APK so the SBOM records its real name and version.
-RUN apk add --no-cache /tmp/zlib-ng-compat.apk \
+RUN apk add --no-cache --force-non-repository /tmp/zlib-ng-compat.apk \
     && apk del zlib \
     && apk upgrade --no-cache \
     && apk add --no-cache \

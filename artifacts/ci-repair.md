@@ -2,6 +2,14 @@
 
 Objective: fix the failing vulnerability gate and BuildKit storage checks, validate, commit, and push.
 
+## Continued validation on October 5, 2026
+
+- Runner refresh found an empty registration journal and no workers. Guarded profile deployment then deferred when a healthy StatementParser worker appeared; no live configuration was changed.
+- Current source validation: run `37299791935`, revision `0bd6c82ec6f9248af58361a642a6f74c8eedd43b`, existing 8 GiB profile. Measure the repaired image before selecting the final capacity.
+- CI runtime worker `/root/ci_runtime_validation`: native OpenAI `gpt-6-luna`, `max`, resolved from the October 5 callable catalog and swarm model policy. Consumer: primary. Owns Dockerfile and packaging runtime fixes only, with CI build, signed APK identity, and scan evidence as acceptance checks. No infrastructure changes, commits, pushes, email probes, or default container command. Base revision: `0bd6c82`. Release after concise evidence handoff; primary retains integration and external actions. Native runtime has no separate backend configuration telemetry or service-tier control.
+- Run `37299791935` failed during image build before scanning. Its valid 100 ms storage report recorded 1,364,926,464 bytes peak against 8 GiB. This partial build is insufficient to select final capacity. Safe wrapper validation passed again. No unrelated jobs were cancelled during this continuation.
+- Runtime worker accepted and released by native completion. The signed APK build completed; final-stage installation failed with apk's non-repository-package/reboot diagnostic (failed-step log lines 818–822). Added `--force-non-repository` to local APK installation, retaining signature verification. Primary reviewed the one-line diff and safe wrapper checks; whitespace checks passed. A fresh run must prove installation, compression, imapsync startup, and the vulnerability gate.
+
 Base revision: `120c3f8e10cbe68faea7a7b2a85c3981f91b3fdd` on `main`.
 Failure evidence: GitHub Actions runs `37240148253` and `37221669931`.
 
