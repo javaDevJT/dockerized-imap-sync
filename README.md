@@ -22,6 +22,13 @@ You should still pass all variables explicitly when running the container.
 
 ## Build
 
+The image uses Alpine 3.24 and checksum-pinned imapsync 2.314. A build stage
+packages zlib-ng 2.3.3 with the compatible zlib ABI to replace the vulnerable
+zlib library. Build tools and signing private keys remain in the build stage.
+The runtime retains APK package metadata for SBOM and vulnerability scanning.
+Builds check compression round-trip behavior and imapsync's version and help.
+Upstream's `--tests` includes remote connections, so it is not run during builds.
+
 ```bash
 docker build -t dockerized-imap-sync .
 ```
@@ -49,6 +56,12 @@ docker run -d \
 - Exits the container on sync failure so an external restart policy can restart it
 
 ## GitHub Actions
+
+Every published digest is scanned with Syft and Grype before release tags are
+applied. Any High or Critical finding fails publication, including findings
+without an available fix. The TrueNAS runner also records and enforces BuildKit
+storage efficiency. See [CI repair evidence](artifacts/ci-repair.md) for the
+failure diagnosis and validation record.
 
 The repository includes a workflow at `.github/workflows/build-image.yml` that builds and pushes the image to GHCR on every push to `main` and on manual dispatch.
 

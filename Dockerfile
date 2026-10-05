@@ -1,4 +1,56 @@
-FROM gilleslamiral/imapsync:latest
+# syntax=docker/dockerfile:1
+
+FROM alpine:3.24 AS imapsync-source
+
+ADD --checksum=sha256:34b7ed8e0948b3f9ccac0318333b726a7263e134784eee6eab429639808b7822 \
+    https://github.com/imapsync/imapsync/archive/93654c6025ff7814f983ab74dd300f9bed9282d9.tar.gz \
+    /tmp/imapsync.tar.gz
+RUN tar -xzf /tmp/imapsync.tar.gz -C /tmp \
+    && install -Dm755 /tmp/imapsync-93654c6025ff7814f983ab74dd300f9bed9282d9/imapsync /usr/local/bin/imapsync
+
+FROM alpine:3.24 AS zlib-build
+
+RUN apk add --no-cache alpine-sdk
+WORKDIR /src/zlib-ng-compat
+COPY packaging/zlib-ng-compat/APKBUILD ./APKBUILD
+RUN abuild-keygen -a -n \
+    && REPODEST=/packages abuild -F -r \
+    && cp /packages/*/*/zlib-ng-compat-*.apk /zlib-ng-compat.apk
+
+FROM alpine:3.24
+
+COPY --from=zlib-build /etc/apk/keys/ /etc/apk/keys/
+COPY --from=zlib-build /zlib-ng-compat.apk /tmp/zlib-ng-compat.apk
+# zlib-ng supplies the same libz ABI without zlib's vulnerable gz_vacate code.
+# Keep the replacement as an APK so the SBOM records its real name and version.
+RUN apk add --no-cache /tmp/zlib-ng-compat.apk \
+    && apk del zlib \
+    && apk upgrade --no-cache \
+    && apk add --no-cache \
+        ca-certificates \
+        perl \
+        perl-digest-hmac \
+        perl-encode-imaputf7 \
+        perl-file-copy-recursive \
+        perl-file-tail \
+        perl-io-socket-inet6 \
+        perl-io-socket-ssl \
+        perl-io-tee \
+        perl-mail-imapclient \
+        perl-ntlm \
+        perl-readonly \
+        perl-regexp-common \
+        perl-sys-meminfo \
+        perl-term-readkey \
+        perl-test-simple \
+        perl-unicode-string \
+    && rm /tmp/zlib-ng-compat.apk \
+    && ! apk info --exists zlib
+
+COPY --from=imapsync-source /usr/local/bin/imapsync /usr/local/bin/imapsync
+RUN perl -MCompress::Zlib -e 'die "compression round trip failed" unless Compress::Zlib::uncompress(Compress::Zlib::compress("imapsync")) eq "imapsync"' \
+    && imapsync --version \
+    && imapsync --help >/dev/null
 
 USER root
 
