@@ -14,10 +14,11 @@ Failure evidence: GitHub Actions runs `37240148253` and `37221669931`.
 ## Delegation
 
 Resolved on October 4, 2026 from the live native spawn catalog: `gpt-6-luna`, reasoning effort `max`. The catalog identifies the other Luna entry as older and exposes `max` as the highest effort for the selected model. No service-tier control is exposed.
+These values were explicitly requested at spawn. The runtime returned agent identities, but did not expose independent backend model or effort telemetry.
 
 - Storage worker: `/root/storage_fix`, accepted and completed (native capacity released); read-only evidence informed capacity sizing and deployment dependencies. No edits. Root checked the downloaded report and will select the final class after the new image build.
 - Runtime dependency investigator: `/root/runtime_dependencies`, accepted and completed (native capacity released), read-only; source pin, exact required package mapping, and detection of live upstream tests were integrated. No file edits or IMAP calls.
-- Runtime review: `/root/runtime_review`, running; read-only review of replacement APK ABI, signing key isolation, package replacement, and image validation. Same resolved model and effort; consumer is primary integration. Release after concise findings.
+- Runtime review: `/root/runtime_review`, accepted and completed (native capacity released); public-key installation and exact package identity corrections were integrated. Primary checked the diff and checksums. Actual installation, ABI, and SBOM behavior remain CI acceptance conditions.
 
 ## Initial findings
 
@@ -37,5 +38,13 @@ Resolved on October 4, 2026 from the live native spawn catalog: `gpt-6-luna`, re
 - Local mock validation passed: six required variables, exact quoted arguments, sync failure propagation, 180-second interval and overrun behavior. No email accounts or servers were contacted.
 - Despite its help text, upstream's `--tests` has active remote TLS/IMAP probes. Build smoke checks therefore use only `--version`, `--help`, and a local compression round trip. The remote test suite is not run.
 - The user explicitly authorized updating this repository's shared TrueNAS runner capacity profile and redeploying the runner.
+
+## Runner update progress
+
+- Added a provisional 2.9 GiB profile alongside the existing 8 GiB profile in the runner project's targets. The original image's measured peak would satisfy the efficiency gate at this size; final sizing still requires the repaired image's measurement.
+- Prepared the rollout from the live Compose configuration, preserving unrelated Tesla profiles, the qualified Dependabot image, the staged source hash, all credentials and volumes. Local pre-existing Compose changes were separately preserved.
+- The guarded deploy refused to update while one runner registration was pending and resumed admission. No app update occurred. The local pending Compose changes were restored with only this repo's added profile.
+- The registration belongs to Discord Option Tailer runner 37, `truenas-discord-option-tailer-storage-16g-5582667a`. GitHub reports it offline and busy, assigned to run `37249336834`; the engine has no worker containers. The idle recovery helper also refused because the runner remains registered, and resumed admission. Authorization was requested before cancelling or retrying that other repository's job.
+- Runtime changes are pushed on `main` through `e67ea8a`. Validation run `37250915005` remains queued; no successful build or security scan is claimed yet. Superseded validation runs were cancelled before useful execution.
 
 Context-mode indexing returned a disk I/O error; bounded native reads and derived output are the fallback.
