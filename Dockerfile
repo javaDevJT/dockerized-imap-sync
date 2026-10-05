@@ -13,7 +13,7 @@ FROM alpine:3.24 AS zlib-build
 RUN apk add --no-cache alpine-sdk
 WORKDIR /src/zlib-ng-compat
 COPY packaging/zlib-ng-compat/APKBUILD ./APKBUILD
-RUN abuild-keygen -a -n \
+RUN abuild-keygen -a -i -n \
     && REPODEST=/packages abuild -F -r \
     && cp /packages/*/*/zlib-ng-compat-*.apk /zlib-ng-compat.apk
 
