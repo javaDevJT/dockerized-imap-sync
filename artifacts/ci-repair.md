@@ -32,7 +32,7 @@ Resolved on October 4, 2026 from the live native spawn catalog: `gpt-6-luna`, re
 - Replace the inherited Debian image with Alpine 3.24 and verified Perl package dependencies. The stable Alpine baseline has one High zlib finding, CVE-2026-85091. imapsync imports Compress::Zlib and Perl links libz, so deleting the library would break the runtime.
 - Package zlib-ng 2.3.3 with its supported zlib ABI and real APK name/version. Its `gzwrite.c` lacks the affected `gz_vacate` function; source archive checksum is pinned in APKBUILD. No scanner exclusions or severity/fix filters were added.
 - The final image receives the signed replacement APK and its public key; private signing keys and compilers remain in the build stage.
-- Independent review caught that abuild-keygen needs `-i` to install the generated public key into `/etc/apk/keys`; the builder now includes it so the final image can verify the APK signature.
+- Independent review caught that the generated public key must be installed into `/etc/apk/keys`. The root builder copies only `*.rsa.pub` there explicitly, avoiding a dependency on a privilege helper and enabling final APK signature verification.
 - Local mock validation passed: six required variables, exact quoted arguments, sync failure propagation, 180-second interval and overrun behavior. No email accounts or servers were contacted.
 - Despite its help text, upstream's `--tests` has active remote TLS/IMAP probes. Build smoke checks therefore use only `--version`, `--help`, and a local compression round trip. The remote test suite is not run.
 - The user explicitly authorized updating this repository's shared TrueNAS runner capacity profile and redeploying the runner.
