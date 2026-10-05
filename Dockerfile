@@ -16,7 +16,7 @@ RUN apk add --no-cache alpine-sdk
 WORKDIR /src/zlib-ng-compat
 COPY packaging/zlib-ng-compat/APKBUILD ./APKBUILD
 RUN abuild-keygen -a -n \
-    && cp /root/.abuild/*.rsa.pub /etc/apk/keys/ \
+    && cp /root/.config/abuild/*.rsa.pub /etc/apk/keys/ \
     && REPODEST=/packages abuild -F -r \
     && cp /packages/*/*/zlib-ng-compat-*.apk /zlib-ng-compat.apk
 
