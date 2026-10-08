@@ -11,7 +11,7 @@ on:
 
 jobs:
   docker:
-    runs-on: truenas-dockerized-imap-sync-storage-4g
+    runs-on: truenas-dockerized-imap-sync-storage-8g
     permissions:
       contents: read
       packages: write
