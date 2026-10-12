@@ -9,6 +9,9 @@ on:
       - main
   workflow_dispatch:
 
+env:
+  DOCKER_BUILD_RECORD_RETENTION_DAYS: "1"
+
 jobs:
   docker:
     runs-on: truenas-dockerized-imap-sync-storage-6g
@@ -105,7 +108,7 @@ jobs:
             ${{ runner.temp }}/ci-storage-usage-start.json
             ${{ runner.temp }}/ci-storage-usage.json
           if-no-files-found: warn
-          retention-days: 14
+          retention-days: 1
       - name: Publish release tags only after the vulnerability gate passes
         shell: bash
         env:
