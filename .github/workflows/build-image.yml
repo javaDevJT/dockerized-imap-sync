@@ -12,6 +12,7 @@ on:
 env:
   DOCKER_BUILD_RECORD_RETENTION_DAYS: "1"
 
+  DOCKER_BUILD_RECORD_UPLOAD: "false"
 jobs:
   docker:
     runs-on: truenas-dockerized-imap-sync-storage-6g
