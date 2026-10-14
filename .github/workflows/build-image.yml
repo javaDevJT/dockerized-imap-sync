@@ -84,7 +84,6 @@ jobs:
           outputs: ${{ steps.container_security_1.outputs.exporter }}
           cache-from: |
             type=local,src=${{ steps.ci_disk_cache_1.outputs.from }}
-            type=gha,version=2,scope=truenas-7586cd64b4ecc22d
           cache-to: ${{ steps.ci_disk_cache_1.outputs.to && format('type=local,dest={0},mode=max,ignore-error=true', steps.ci_disk_cache_1.outputs.to) || '' }}
           context: .
           push: false # Push-by-digest is configured in the exporter; tags follow the scan.
@@ -100,15 +99,22 @@ jobs:
       - name: Finish and enforce BuildKit storage usage
         if: always()
         run: ci-storage-efficiency finish
-      - name: Upload BuildKit storage usage report
+      - name: Format bounded plaintext storage diagnostics
+        id: storage_log
         if: always()
+        run: |
+          python3 .github/scripts/format-storage-evidence.py \
+            --output "$RUNNER_TEMP/ci-storage-evidence.log" \
+            --repository "$GITHUB_REPOSITORY" --revision "$GITHUB_SHA" \
+            --usage-input "$RUNNER_TEMP/ci-storage-usage-start.json" \
+            --usage-input "$RUNNER_TEMP/ci-storage-usage.json"
+      - name: Upload bounded storage diagnostics
+        if: ${{ always() && steps.storage_log.outputs.available == 'true' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: buildkit-storage-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}-${{ strategy.job-index || 0 }}
-          path: |
-            ${{ runner.temp }}/ci-storage-usage-start.json
-            ${{ runner.temp }}/ci-storage-usage.json
-          if-no-files-found: warn
+          name: ci-log-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}-${{ strategy.job-index || 0 }}
+          path: ${{ runner.temp }}/ci-storage-evidence.log
+          if-no-files-found: error
           retention-days: 1
       - name: Publish release tags only after the vulnerability gate passes
         shell: bash
@@ -116,3 +122,28 @@ jobs:
           SECURITY_IMAGE: ${{ steps.container_security_1.outputs.repository }}@${{ steps.container_build_1.outputs.digest }}
           SECURITY_REPORT_DIRECTORY: ${{ runner.temp }}/container-security/build-1
         run: bash .github/actions/container-security/container-security.sh publish
+
+  cleanup-artifacts:
+    name: Remove transient build artifacts
+    needs: ["docker"]
+    if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    runs-on: truenas-dockerized-imap-sync-storage-8g
+    timeout-minutes: 10
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Check out trusted default branch cleanup code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - name: Set up Python for bounded cleanup
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+      - name: Delete non-retained current-run artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/cleanup-actions-artifacts.py --current
+

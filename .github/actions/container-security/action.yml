@@ -11,7 +11,7 @@ inputs:
     description: Job-local directory for SBOMs and vulnerability reports
     required: true
   artifact-name:
-    description: Unique artifact name for this job and build
+    description: Unique suffix for the retained High/Critical findings report
     required: true
 runs:
   using: composite
@@ -28,6 +28,7 @@ runs:
         grype-version: v0.118.0
         cache-db: false
     - name: Scan every platform and enforce High/Critical gate
+      id: scan
       shell: bash
       env:
         SECURITY_IMAGE: ${{ inputs.image }}
@@ -40,11 +41,49 @@ runs:
         # the job's disk-backed temp directory for larger image layers.
         TMPDIR: ${{ runner.temp }}
       run: bash "$SECURITY_ACTION_PATH/container-security.sh" scan
-    - name: Retain SBOMs and vulnerability reports
+    - name: Minimize complete reports after the vulnerability gate
+      id: minimize
       if: ${{ always() }}
+      shell: bash
+      env:
+        SECURITY_REPORT_DIRECTORY: ${{ inputs.report-directory }}
+        SECURITY_PLATFORMS: ${{ inputs.platforms }}
+        SECURITY_IMAGE: ${{ inputs.image }}
+      run: |
+        set -euo pipefail
+        platforms=()
+        IFS=',' read -r -a platforms <<< "${SECURITY_PLATFORMS//$'\n'/,}"
+        args=(python3 "$GITHUB_WORKSPACE/.github/scripts/minimize-security-reports.py")
+        count=0
+        for platform in "${platforms[@]}"; do
+          platform="${platform//[[:space:]]/}"
+          [[ "$platform" =~ ^linux/(amd64|arm64)(/v[0-9]+)?$ ]] || {
+            echo "::error::Unsupported image platform while preparing retained findings" >&2
+            exit 2
+          }
+          suffix="${platform//\//-}"
+          report="$SECURITY_REPORT_DIRECTORY/$suffix.grype.json"
+          if [[ ! -s "$report" ]]; then
+            echo "::notice::Complete Grype reports are not available for every platform; no findings artifact is emitted."
+            exit 0
+          fi
+          args+=(--input "$report")
+          count=$((count + 1))
+        done
+        (( count > 0 )) || {
+          echo "::error::No image platforms were configured for retained findings" >&2
+          exit 2
+        }
+        args+=(--output "$RUNNER_TEMP/security-high-critical.json"
+          --repository "$GITHUB_REPOSITORY" --revision "$GITHUB_SHA"
+          --image "$SECURITY_IMAGE" --platform "$SECURITY_PLATFORMS")
+        "${args[@]}"
+        echo "available=true" >> "$GITHUB_OUTPUT"
+    - name: Upload minimized High/Critical findings
+      if: ${{ always() && steps.minimize.outputs.available == 'true' }}
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       with:
-        name: ${{ inputs.artifact-name }}
-        path: ${{ inputs.report-directory }}/
+        name: security-high-critical-${{ inputs.artifact-name }}
+        path: ${{ runner.temp }}/security-high-critical.json
         retention-days: 1
-        if-no-files-found: warn
+        if-no-files-found: error
