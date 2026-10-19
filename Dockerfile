@@ -71,6 +71,9 @@ RUN perl -e 'die "Perl 5.44 or newer required\n" unless $^V ge v5.44.0' \
 
 USER root
 
+ARG QB_SOURCE_COMMIT=unknown
+ENV QB_SOURCE_COMMIT=${QB_SOURCE_COMMIT}
+
 ENV IMAP1_HOST="imap.mail.yahoo.com" \
     IMAP1_USER="" \
     IMAP1_PASSWORD="" \
@@ -123,4 +126,12 @@ RUN printf '%s\n' \
     > /usr/local/bin/run-loop \
     && chmod +x /usr/local/bin/run-loop
 
-CMD ["/usr/local/bin/run-loop"]
+COPY docker/qb-health-server.pl /usr/local/bin/qb-health-server
+COPY docker/qb-entrypoint.sh /usr/local/bin/qb-entrypoint
+RUN chmod 0755 /usr/local/bin/qb-health-server /usr/local/bin/qb-entrypoint
+
+EXPOSE 8080
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD ["/usr/bin/perl", "/usr/local/bin/qb-health-server", "--probe"]
+
+ENTRYPOINT ["/usr/local/bin/qb-entrypoint"]
