@@ -13,6 +13,10 @@ inputs:
   artifact-name:
     description: Unique suffix for the retained High/Critical findings report
     required: true
+  revision:
+    description: Source commit corresponding to the scanned image
+    required: false
+    default: ""
 runs:
   using: composite
   steps:
@@ -49,6 +53,7 @@ runs:
         SECURITY_REPORT_DIRECTORY: ${{ inputs.report-directory }}
         SECURITY_PLATFORMS: ${{ inputs.platforms }}
         SECURITY_IMAGE: ${{ inputs.image }}
+        SECURITY_REPORT_REVISION: ${{ inputs.revision || github.sha }}
       run: |
         set -euo pipefail
         platforms=()
@@ -75,7 +80,7 @@ runs:
           exit 2
         }
         args+=(--output "$RUNNER_TEMP/security-high-critical.json"
-          --repository "$GITHUB_REPOSITORY" --revision "$GITHUB_SHA"
+          --repository "$GITHUB_REPOSITORY" --revision "$SECURITY_REPORT_REVISION"
           --image "$SECURITY_IMAGE" --platform "$SECURITY_PLATFORMS")
         "${args[@]}"
         echo "available=true" >> "$GITHUB_OUTPUT"

@@ -7,6 +7,7 @@ on:
   push:
     branches:
       - main
+  pull_request_target:
   workflow_dispatch:
 
 env:
@@ -14,7 +15,84 @@ env:
 
   DOCKER_BUILD_RECORD_UPLOAD: "false"
 jobs:
+  validate-pr:
+    name: Build and scan pull request image
+    if: >-
+      github.repository == 'javaDevJT/dockerized-imap-sync' &&
+      github.event_name == 'pull_request_target' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      ((github.actor == 'javaDevJT' && github.event.pull_request.user.login == 'javaDevJT') ||
+       (github.actor == 'quarterback-ci[bot]' && github.event.pull_request.user.id == 341165314))
+    runs-on: truenas-dockerized-imap-sync-storage-6g
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      BUILDKIT_HOST: tcp://buildkit:1234
+      BUILDKIT_TLS_CA_CERT: /run/buildkit/tls/ca.pem
+      BUILDKIT_TLS_CLIENT_CERT: /run/buildkit/tls/client.pem
+      BUILDKIT_TLS_CLIENT_KEY: /run/buildkit/tls/client.key
+    steps:
+      - name: Start BuildKit storage collection
+        run: ci-storage-efficiency start
+      - name: Check out authorized same-repository pull request source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Set up Buildx on the private BuildKit service
+        uses: docker/setup-buildx-action@v3
+        with:
+          cache-binary: false
+          driver: remote
+          endpoint: tcp://buildkit:1234
+          driver-opts: |
+            cacert=/run/buildkit/tls/ca.pem
+            cert=/run/buildkit/tls/client.pem
+            key=/run/buildkit/tls/client.key
+      - name: Prepare local OCI candidate
+        id: container_security_pr
+        shell: bash
+        env:
+          SECURITY_PUBLISH: "false"
+          SECURITY_REPORT_DIRECTORY: ${{ runner.temp }}/container-security/pr
+        run: bash .github/actions/container-security/container-security.sh prepare
+      - name: Build pull request image without registry credentials
+        id: container_build_pr
+        uses: docker/build-push-action@v6
+        with:
+          platforms: linux/amd64
+          outputs: ${{ steps.container_security_pr.outputs.exporter }}
+          context: .
+          file: ./Dockerfile
+          build-args: QB_SOURCE_COMMIT=${{ github.event.pull_request.head.sha }}
+          pull: true
+          push: false
+      - name: Generate SBOM and enforce High/Critical vulnerability gate
+        uses: ./.github/actions/container-security
+        with:
+          image: ${{ steps.container_security_pr.outputs.archive }}
+          platforms: "linux/amd64"
+          report-directory: ${{ runner.temp }}/container-security/pr
+          artifact-name: container-security-pr-${{ github.run_id }}-${{ github.run_attempt }}
+          revision: ${{ github.event.pull_request.head.sha }}
+      - name: Remove local PR candidate and reports
+        if: always()
+        shell: bash
+        env:
+          SECURITY_ARCHIVE: ${{ steps.container_security_pr.outputs.archive }}
+          SECURITY_REPORT_DIRECTORY: ${{ runner.temp }}/container-security/pr
+        run: |
+          set -euo pipefail
+          if [[ -n "$SECURITY_ARCHIVE" ]]; then rm -f -- "$SECURITY_ARCHIVE"; fi
+          rm -rf -- "$SECURITY_REPORT_DIRECTORY"
+      - name: Finish and enforce BuildKit storage usage
+        if: always()
+        run: ci-storage-efficiency finish
+
   docker:
+    if: github.repository == 'javaDevJT/dockerized-imap-sync' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request_target'
     runs-on: truenas-dockerized-imap-sync-storage-6g
     permissions:
       contents: read
@@ -89,6 +167,7 @@ jobs:
           context: .
           push: false # Push-by-digest is configured in the exporter; tags follow the scan.
           tags: ${{ steps.container_security_1.outputs.repository }}
+          build-args: QB_SOURCE_COMMIT=${{ github.sha }}
           labels: ${{ steps.meta.outputs.labels }}
       - name: Generate SBOM and enforce High/Critical vulnerability gate
         uses: ./.github/actions/container-security
@@ -123,11 +202,36 @@ jobs:
           SECURITY_IMAGE: ${{ steps.container_security_1.outputs.repository }}@${{ steps.container_build_1.outputs.digest }}
           SECURITY_REPORT_DIRECTORY: ${{ runner.temp }}/container-security/build-1
         run: bash .github/actions/container-security/container-security.sh publish
+      - name: Emit verified build receipt marker
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          PUBLISHED_DIGESTS: ${{ runner.temp }}/container-security/build-1/published-digests.txt
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]
+          [[ -s "$PUBLISHED_DIGESTS" ]]
+          published_digest=""
+          while IFS=' ' read -r tag digest extra; do
+            [[ -n "$tag" && "$digest" =~ ^sha256:[a-f0-9]{64}$ && -z "${extra:-}" ]]
+            if [[ -z "$published_digest" ]]; then
+              published_digest="$digest"
+            else
+              [[ "$published_digest" == "$digest" ]]
+            fi
+          done < "$PUBLISHED_DIGESTS"
+          [[ -n "$published_digest" ]]
+          printf 'QB_BUILD_RECEIPT_V1 source_sha=%s run_id=%s run_attempt=%s digest=%s\n' \
+            "$SOURCE_SHA" "$RUN_ID" "$RUN_ATTEMPT" "$published_digest"
 
   cleanup-artifacts:
     name: Remove transient build artifacts
     needs: ["docker"]
-    if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    if: ${{ always() && github.repository == 'javaDevJT/dockerized-imap-sync' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request_target' }}
     runs-on: truenas-dockerized-imap-sync-storage-8g
     timeout-minutes: 10
     permissions:
