@@ -1,0 +1,4 @@
+.git
+artifacts/
+ops/
+**/__pycache__/

@@ -1,0 +1,3 @@
+artifacts/.private-openwoof/
+telemetry/__pycache__/
+telemetry/tests/__pycache__/

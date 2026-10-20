@@ -1,0 +1,26 @@
+import assert from 'node:assert/strict';
+import {readFileSync} from 'node:fs';
+import {makeValues,secureFile,multipart,privateSecret,parseRuntimeOutput,HOST_KEY,CONTAINER_KEY} from './deploy-openwoof.mjs';
+const before={image:{repository:'ghcr.io/javadevjt/dockerized-imap-sync',tag:'old',pull_policy:'missing'},
+ envs:[{name:'IMAP1_PASSWORD',value:'test-only-mail-password'},{name:'OTEL_EXPORTER_OTLP_TRACES_HEADERS',value:'test-only-conflict'}],storage:[]};
+const copy=structuredClone(before),v=makeValues(before,'sha256:'+'a'.repeat(64));
+assert.deepEqual(before,copy);
+assert(v.envs.some(x=>x.name==='IMAP1_PASSWORD'&&x.value==='test-only-mail-password'));
+assert(!v.envs.some(x=>x.name==='OTEL_EXPORTER_OTLP_TRACES_HEADERS'));
+assert(v.envs.some(x=>x.name==='OPENWOOF_INGEST_KEY_FILE'&&x.value===CONTAINER_KEY));
+assert.equal(v.storage[0].host_path_config.path,HOST_KEY);assert.equal(v.storage[0].read_only,true);
+assert.equal(v.privileged,false);
+assert.throws(()=>makeValues({...before,storage:v.storage},'sha256:'+'a'.repeat(64)));
+assert.throws(()=>makeValues(before,'https://unexpected.example/image'));
+const s={realpath:HOST_KEY,type:'FILE',uid:0,gid:0,mode:0o100600,size:10},acl={path:HOST_KEY,trivial:true};
+assert(secureFile(s,acl));for(const bad of [{mode:0o100644},{uid:568},{realpath:'/other'},{type:'SYMLINK'},{size:0}])assert(!secureFile({...s,...bad},acl));
+assert(!secureFile(s,{...acl,trivial:false}));
+const synthetic=Buffer.from('synthetic-upload-only');const m=multipart(synthetic,'fixed-test-boundary');
+assert(m.body.includes(synthetic));assert(m.body.includes(Buffer.from('filesystem.put')));assert(m.body.includes(Buffer.from(HOST_KEY)));
+const source=readFileSync(new URL('./deploy-openwoof.mjs',import.meta.url),'utf8');
+assert(!source.includes('rejectUnauthorized:false'));assert(source.includes("servername:'localhost',rejectUnauthorized:true"));
+const bytes=await privateSecret('--test-ipc');assert.equal(bytes.toString(),'synthetic-ipc-token-7b9e2c41');bytes.fill(0);
+const parsed=parseRuntimeOutput('untrusted arbitrary PTY text\r\n{"event":"openwoof.runtime_check","secret_read_only":true}\r\n{"event":"openwoof.validation_receipt","outcome":"success"}\r\nOPENWOOF_VALIDATE_EXIT=0;RUNTIME_EXIT=0\r\n');
+assert.equal(parsed.runtime.secret_read_only,true);assert.equal(parsed.validationExit,0);
+assert.throws(()=>parseRuntimeOutput('OPENWOOF_VALIDATE_EXIT=0;RUNTIME_EXIT=0'));
+console.log('deployment tests passed: preserved config, fixed path/read-only mount, file ACL guards, pinned TLS, private pipe');

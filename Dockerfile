@@ -12,16 +12,18 @@ RUN tar -xzf /tmp/imapsync.tar.gz -C /tmp \
 
 FROM ${ALPINE_IMAGE} AS zlib-build
 
-RUN apk add --no-cache alpine-sdk
+RUN apk add --no-cache alpine-sdk python3 py3-pip
 WORKDIR /src/zlib-ng-compat
-COPY packaging/ /src/
+COPY packaging/ telemetry/requirements.lock /src/
 RUN abuild-keygen -a -n \
     && cp /root/.config/abuild/*.rsa.pub /etc/apk/keys/ \
     && REPODEST=/packages abuild -F -r \
     && cp /packages/*/*/zlib-ng-compat-*.apk /zlib-ng-compat.apk \
     && cd /src/posix-shell \
     && REPODEST=/packages abuild -F -r \
-    && cp /packages/*/*/posix-shell-*.apk /posix-shell.apk
+    && cp /packages/*/*/posix-shell-*.apk /posix-shell.apk \
+    && python3 -m pip install --no-cache-dir --no-compile --require-hashes \
+        --target /python-packages -r /src/requirements.lock
 
 FROM ${ALPINE_IMAGE}
 
@@ -54,6 +56,7 @@ RUN apk add --no-cache --force-non-repository /tmp/zlib-ng-compat.apk \
         perl-test-simple \
         perl-unicode-string \
         procps-ng \
+        python3 \
     && apk add --no-cache --force-non-repository /tmp/posix-shell.apk \
     && apk del busybox busybox-binsh ssl_client \
     && rm /tmp/zlib-ng-compat.apk /tmp/posix-shell.apk \
@@ -63,11 +66,19 @@ RUN apk add --no-cache --force-non-repository /tmp/zlib-ng-compat.apk \
     && /bin/sh -ec 'test "$((180 - 1))" -eq 179; date +%s >/dev/null; sleep 0'
 
 COPY --from=imapsync-source /usr/local/bin/imapsync /usr/local/bin/imapsync
-RUN perl -e 'die "Perl 5.44 or newer required\n" unless $^V ge v5.44.0' \
+COPY --from=zlib-build /python-packages /opt/otel
+COPY telemetry/runner.py telemetry/requirements.lock /opt/telemetry/
+ARG BUILD_REVISION=unknown
+ENV PYTHONPATH=/opt/otel \
+    SERVICE_VERSION=2.314-${BUILD_REVISION}
+RUN --mount=type=bind,source=telemetry,target=/tmp/telemetry-tests,readonly \
+    perl -e 'die "Perl 5.44 or newer required\n" unless $^V ge v5.44.0' \
     && perl -e 'my @rss = qx{ps -o rss -p $$}; shift @rss; die "ps RSS check failed\n" unless @rss == 1 && $rss[0] =~ /^\s*\d+\s*$/' \
     && perl -MCompress::Zlib -e 'die "compression round trip failed" unless Compress::Zlib::uncompress(Compress::Zlib::compress("imapsync")) eq "imapsync"' \
     && imapsync --version \
-    && imapsync --help >/dev/null
+    && imapsync --help >/dev/null \
+    && python3 -c 'from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter; from opentelemetry.sdk._logs import LoggerProvider; from opentelemetry.instrumentation.logging.handler import LoggingHandler; from opentelemetry.sdk.metrics import MeterProvider' \
+    && PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s /tmp/telemetry-tests -p 'test_*.py'
 
 USER root
 
@@ -111,6 +122,10 @@ RUN printf '%s\n' \
 RUN printf '%s\n' \
     '#!/bin/sh' \
     'set -eu' \
+    '' \
+    'if [ "${OPENWOOF_INGEST_KEY_FILE+x}" = x ]; then' \
+    '  exec python3 /opt/telemetry/runner.py' \
+    'fi' \
     '' \
     'while true; do' \
     '  start="$(date +%s)"' \

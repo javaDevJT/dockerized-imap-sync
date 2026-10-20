@@ -67,7 +67,9 @@ jobs:
           outputs: ${{ steps.container_security_pr.outputs.exporter }}
           context: .
           file: ./Dockerfile
-          build-args: QB_SOURCE_COMMIT=${{ github.event.pull_request.head.sha }}
+          build-args: |
+            QB_SOURCE_COMMIT=${{ github.event.pull_request.head.sha }}
+            BUILD_REVISION=${{ github.event.pull_request.head.sha }}
           pull: true
           push: false
       - name: Generate SBOM and enforce High/Critical vulnerability gate
@@ -166,9 +168,11 @@ jobs:
             type=local,src=${{ steps.ci_disk_cache_1.outputs.from }}
           cache-to: ${{ steps.ci_disk_cache_1.outputs.to && format('type=local,dest={0},mode=max,ignore-error=true', steps.ci_disk_cache_1.outputs.to) || '' }}
           context: .
+          build-args: |
+            QB_SOURCE_COMMIT=${{ github.sha }}
+            BUILD_REVISION=${{ github.sha }}
           push: false # Push-by-digest is configured in the exporter; tags follow the scan.
           tags: ${{ steps.container_security_1.outputs.repository }}
-          build-args: QB_SOURCE_COMMIT=${{ github.sha }}
           labels: ${{ steps.meta.outputs.labels }}
       - name: Generate SBOM and enforce High/Critical vulnerability gate
         uses: ./.github/actions/container-security

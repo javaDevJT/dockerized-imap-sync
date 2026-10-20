@@ -1,5 +1,8 @@
 # dockerized-imap-sync
 
+Operational records: [CI repair and deployment](artifacts/ci-repair.md),
+[TrueNAS OpenWoof instrumentation](artifacts/openwoof-telemetry.md).
+
 This container reproduces the behavior of the Kubernetes `CronJob` in `imap-cron.yml` by running `imapsync` inside a standalone Docker container with a minimum 3-minute interval between run starts.
 
 ## Runtime environment variables
@@ -59,6 +62,19 @@ docker run -d \
 - Uses the same sync flags as the original Kubernetes job
 - Fails fast if any required runtime variables are missing
 - Exits the container on sync failure so an external restart policy can restart it
+
+## OpenWoof telemetry
+
+The image includes the pinned official OpenTelemetry Python SDK. Set
+`OPENWOOF_INGEST_KEY_FILE` to an owner-readable, read-only mounted secret file
+to enable traces, operational logs and metrics for the existing sync loop.
+The destination is `https://openwoof.javadevjt.tech` over verified HTTPS.
+Without that setting, the original shell loop remains available.
+
+See [telemetry configuration and safe validation](telemetry/README.md) and the
+[TrueNAS deployment record](artifacts/openwoof-telemetry.md). Operator tooling
+in `ops/` keeps the credential in macOS Keychain and an app-scoped protected NAS
+file; credential values never belong in source or command arguments.
 
 ## GitHub Actions
 
