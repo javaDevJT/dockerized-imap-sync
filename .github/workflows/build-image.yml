@@ -61,7 +61,7 @@ jobs:
         run: bash .github/actions/container-security/container-security.sh prepare
       - name: Build pull request image without registry credentials
         id: container_build_pr
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           platforms: linux/amd64
           outputs: ${{ steps.container_security_pr.outputs.exporter }}
@@ -158,7 +158,7 @@ jobs:
         run: bash .github/actions/container-security/container-security.sh prepare
       - name: Build and push image
         id: container_build_1
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           platforms: linux/amd64
           outputs: ${{ steps.container_security_1.outputs.exporter }}
