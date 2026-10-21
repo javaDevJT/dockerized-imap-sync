@@ -7,6 +7,9 @@ import signal
 import subprocess
 import tempfile
 import unittest
+import json
+import time
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -69,6 +72,9 @@ class FakeTelemetry:
         self.run_duration = FakeInstrument()
         self.validation_counter = FakeInstrument()
         self.validation_duration = FakeInstrument()
+        self.request_counter = FakeInstrument()
+        self.request_duration = FakeInstrument()
+        self.request_events: list[dict[str, Any]] = []
 
     def emit(self, level: int, message: str, attributes: dict[str, Any] | None = None) -> None:
         active = self.tracer.active
@@ -83,6 +89,21 @@ class FakeTelemetry:
         attributes = {"outcome": outcome}
         self.validation_counter.add(1, attributes)
         self.validation_duration.record(duration, attributes)
+
+    def record_imap_request(self, event: dict[str, Any]) -> None:
+        self.request_events.append(dict(event))
+        attributes = {"command": event["command"], "error": event["error"]}
+        self.request_counter.add(1, attributes)
+        self.request_duration.record((event["end_ns"] - event["start_ns"]) / 1_000_000_000, attributes)
+
+    def force_flush(self) -> bool:
+        return True
+
+    def reset_export_results(self) -> None:
+        pass
+
+    def export_states(self) -> dict[str, Any]:
+        return {}
 
     @staticmethod
     def mark_error(span: FakeSpan, description: str) -> None:
@@ -114,11 +135,19 @@ class FakeEvent:
 
 
 class FakeChild:
-    def __init__(self, return_code: int = 0, during_wait: Any = None) -> None:
+    def __init__(
+        self,
+        return_code: int = 0,
+        during_wait: Any = None,
+        stdout: bytes = b"",
+        stderr: bytes = b"",
+    ) -> None:
         self.return_code = return_code
         self.during_wait = during_wait
         self.sent_signals: list[int] = []
         self.exited = False
+        self.stdout = io.BytesIO(stdout)
+        self.stderr = io.BytesIO(stderr)
 
     def poll(self) -> int | None:
         return self.return_code if self.exited else None
@@ -134,6 +163,31 @@ class FakeChild:
 
 
 class RunnerTests(unittest.TestCase):
+    def test_ordinary_log_line_is_available_without_waiting_for_next_chunk(self) -> None:
+        redactor = runner.StreamingSecretRedactor(["a-very-long-private-token"])
+        self.assertEqual(redactor.feed(b"Fetched 1 message\n"), b"Fetched 1 message\n")
+        self.assertEqual(redactor.feed(b"a-very-long-pri"), b"")
+        self.assertEqual(redactor.feed(b"vate-token\n"), b"[REDACTED]\n")
+
+    def test_streaming_preserves_unicode_in_console_and_exported_body(self) -> None:
+        class ChunkStream:
+            def __init__(self) -> None:
+                self.chunks = iter([b"Caf\xc3", b"\xa9 \xf0", b"\x9f\x93\xa7\n", b""])
+            def read(self, _size: int) -> bytes:
+                return next(self.chunks)
+            def close(self) -> None:
+                pass
+
+        telemetry = FakeTelemetry()
+        console = io.StringIO()
+        counts = {"stdout_lines": 0, "export_failures": 0}
+        pump = runner.ChildOutputPump(ChunkStream(), "stdout", logging.INFO, telemetry, console,
+                                      threading.Lock(), runner.StreamingSecretRedactor([]), counts, threading.Lock())
+        pump.run()
+        self.assertEqual(console.getvalue(), "Café 📧\n")
+        self.assertEqual(telemetry.events[0][1], "Café 📧")
+        self.assertEqual(telemetry.events[0][2]["event"], "imapsync.output")
+
     def test_secret_is_read_once_and_auth_header_is_single_raw_bearer(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             secret_path = Path(temp_dir) / "key"
@@ -300,7 +354,123 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue(any(event[2].get("validation_marker") == marker for event in correlated))
         self.assertEqual(telemetry.validation_counter.values[0][1], {"outcome": "success"})
 
-    def test_sync_failure_exits_without_sleep_and_suppresses_child_output(self) -> None:
+    def test_request_event_validation_and_split_secret_redaction(self) -> None:
+        event = {
+            "event": "imap.request",
+            "command": "UID FETCH",
+            "server_role": "source",
+            "server_address": "imap.example.test",
+            "server_port": 993,
+            "tls": True,
+            "start_ns": time.time_ns(),
+            "end_ns": time.time_ns() + 1_000_000,
+            "response_status": "OK",
+            "error": False,
+        }
+        self.assertIs(runner.validate_request_event(event), event)
+        with self.assertRaises(ValueError):
+            runner.validate_request_event({**event, "extra": "private"})
+        with self.assertRaises(ValueError):
+            runner.validate_request_event({**event, "server_address": "alice@example.test"})
+        normalized = runner.validate_request_event({**event, "server_address": "[2001:db8::1]"})
+        self.assertEqual(normalized["server_address"], "2001:db8::1")
+        with self.assertRaises(ValueError):
+            runner.validate_request_event({**event, "server_address": "[imap.example.test]"})
+        for status in ("NO", "BAD", "BYE", "ERROR", "UNKNOWN"):
+            with self.subTest(status=status), self.assertRaises(ValueError):
+                runner.validate_request_event({**event, "response_status": status})
+        with self.assertRaises(ValueError):
+            runner.validate_request_event({**event, "error": True})
+        logout = {**event, "command": "LOGOUT", "response_status": "BYE"}
+        self.assertIs(runner.validate_request_event(logout), logout)
+
+        redactor = runner.StreamingSecretRedactor(["source-super-secret"])
+        first = redactor.feed(b"safe source-super-")
+        second = redactor.feed(b"secret tail", final=True)
+        combined = first + second
+        self.assertEqual(combined, b"safe [REDACTED] tail")
+        self.assertNotIn(b"source-super-secret", combined)
+
+    def test_sync_streams_redacted_output_and_request_events_then_writes_summary(self) -> None:
+        telemetry = FakeTelemetry()
+        start_ns = time.time_ns()
+        event = {
+            "event": "imap.request",
+            "command": "UID FETCH",
+            "server_role": "source",
+            "server_address": "imap.example.test",
+            "server_port": 993,
+            "tls": True,
+            "start_ns": start_ns,
+            "end_ns": start_ns + 2_000_000,
+            "response_status": "NO",
+            "error": True,
+        }
+        malformed = {**event, "command": "AUTHENTICATE PLAIN alice@example.test"}
+        child = FakeChild(
+            stdout=b"Connected as alice@example.test with source-super-secret\nFetched 1 message\n",
+            stderr=b"Bearer ingest-secret-value was rejected\n",
+        )
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        child_environment = {
+            "IMAP1_USER": "alice@example.test",
+            "IMAP1_PASSWORD": "source-super-secret",
+            "IMAP2_USER": "bob@example.test",
+            "IMAP2_PASSWORD": "destination-secret",
+            "PERL5OPT": "-w",
+            "PERL5LIB": "/existing/perl",
+        }
+        received_options: list[dict[str, Any]] = []
+
+        def popen(_command: Any, **options: Any) -> FakeChild:
+            received_options.append(options)
+            event_fd = options["pass_fds"][0]
+            os.write(event_fd, json.dumps(event).encode() + b"\n")
+            os.write(event_fd, json.dumps(malformed).encode() + b"\n")
+            return child
+
+        instance = runner.Runner(
+            telemetry,
+            popen=popen,
+            environ=child_environment,
+            ingest_key="ingest-secret-value",
+            stdout=stdout,
+            stderr=stderr,
+        )
+        self.assertEqual(instance._run_command(validation=False), 0)
+
+        options = received_options[0]
+        self.assertEqual(options["stdout"], subprocess.PIPE)
+        self.assertEqual(options["stderr"], subprocess.PIPE)
+        self.assertEqual(options["env"]["IMAP_TELEMETRY_FD"], str(options["pass_fds"][0]))
+        self.assertEqual(options["env"]["PERL5OPT"], "-w -MImapTelemetry")
+        self.assertEqual(options["env"]["PERL5LIB"], os.pathsep.join(("/existing/perl", "/opt/telemetry")))
+        self.assertEqual([item["command"] for item in telemetry.request_events], ["UID FETCH"])
+        self.assertEqual(len(telemetry.request_events), 1)
+        self.assertIn("Connected as [REDACTED] with [REDACTED]", stdout.getvalue())
+        self.assertIn("Fetched 1 message", stdout.getvalue())
+        self.assertNotIn("alice@example.test", stdout.getvalue())
+        self.assertNotIn("source-super-secret", stdout.getvalue())
+        self.assertIn("Bearer [REDACTED] was rejected", stderr.getvalue())
+        self.assertNotIn("ingest-secret-value", stderr.getvalue())
+        receipt = json.loads(stdout.getvalue().splitlines()[-1])
+        self.assertEqual(receipt["event"], "imap.telemetry.summary")
+        self.assertEqual(receipt["request_spans"], 1)
+        self.assertEqual(receipt["request_errors"], 1)
+        self.assertEqual(receipt["stdout_lines"], 2)
+        self.assertEqual(receipt["stderr_lines"], 1)
+        self.assertEqual(receipt["malformed_events"], 1)
+        self.assertEqual(receipt["command_counts"], {"UID FETCH": 1})
+        self.assertEqual(receipt["server_addresses"], ["imap.example.test"])
+        self.assertEqual(receipt["server_roles"], {"source": 1, "destination": 0, "unknown": 0})
+        self.assertEqual(receipt["server_addresses_omitted"], 0)
+        self.assertEqual(receipt["command_exit_code"], 0)
+        self.assertEqual(receipt["sync_outcome"], "success")
+        self.assertTrue(receipt["export_success"])
+        self.assertTrue(receipt["flush_success"])
+
+    def test_sync_failure_exits_without_sleep_and_preserves_child_output_pipes(self) -> None:
         telemetry = FakeTelemetry()
         event = FakeEvent()
         commands: list[tuple[Any, dict[str, Any]]] = []
@@ -310,11 +480,11 @@ class RunnerTests(unittest.TestCase):
             commands.append((command, kwargs))
             return child
 
-        runner_instance = runner.Runner(telemetry, popen=popen, wake_event=event)
+        runner_instance = runner.Runner(telemetry, popen=popen, wake_event=event, stdout=io.StringIO(), stderr=io.StringIO())
         self.assertEqual(runner_instance.run_forever(), 23)
         self.assertEqual(commands[0][0], runner.RUN_COMMAND)
-        self.assertEqual(commands[0][1]["stdout"], subprocess.DEVNULL)
-        self.assertEqual(commands[0][1]["stderr"], subprocess.DEVNULL)
+        self.assertEqual(commands[0][1]["stdout"], subprocess.PIPE)
+        self.assertEqual(commands[0][1]["stderr"], subprocess.PIPE)
         self.assertEqual(event.waits, [])
         self.assertEqual(telemetry.run_counter.values[0][1], {"outcome": "failure"})
         self.assertEqual(telemetry.tracer.spans[0].status, "imapsync did not complete successfully")
@@ -322,7 +492,7 @@ class RunnerTests(unittest.TestCase):
     def test_signal_during_sync_is_forwarded_and_correlated(self) -> None:
         telemetry = FakeTelemetry()
         child = FakeChild(return_code=-signal.SIGTERM)
-        runner_instance = runner.Runner(telemetry, popen=lambda *_args, **_kwargs: child)
+        runner_instance = runner.Runner(telemetry, popen=lambda *_args, **_kwargs: child, stdout=io.StringIO(), stderr=io.StringIO())
         child.during_wait = lambda: runner_instance.handle_signal(signal.SIGTERM)
 
         self.assertEqual(runner_instance.run_forever(), 128 + signal.SIGTERM)
@@ -341,7 +511,7 @@ class RunnerTests(unittest.TestCase):
             runner_instance.handle_signal(signal.SIGTERM)
             return child
 
-        runner_instance = runner.Runner(telemetry, popen=popen)
+        runner_instance = runner.Runner(telemetry, popen=popen, stdout=io.StringIO(), stderr=io.StringIO())
         self.assertEqual(runner_instance.run_forever(), 128 + signal.SIGTERM)
         self.assertEqual(child.sent_signals, [signal.SIGTERM])
         signal_events = [event for event in telemetry.events if event[1] == "runner.signal_received"]
@@ -370,7 +540,7 @@ class RunnerTests(unittest.TestCase):
             child.wait = wait  # type: ignore[method-assign]
             return child
 
-        runner_instance = runner.Runner(telemetry, popen=popen, monotonic=clock, wake_event=event)
+        runner_instance = runner.Runner(telemetry, popen=popen, monotonic=clock, wake_event=event, stdout=io.StringIO(), stderr=io.StringIO())
         self.assertEqual(runner_instance.run_forever(), 128 + signal.SIGTERM)
         self.assertEqual(event.waits, [140.0])
         self.assertEqual(len(telemetry.tracer.spans), 1)

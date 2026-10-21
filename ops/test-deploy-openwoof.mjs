@@ -1,10 +1,13 @@
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
-import {makeValues,secureFile,multipart,privateSecret,parseRuntimeOutput,HOST_KEY,CONTAINER_KEY} from './deploy-openwoof.mjs';
+import {makeValues,secureFile,multipart,privateSecret,parseRuntimeOutput,configHash,HOST_KEY,CONTAINER_KEY} from './deploy-openwoof.mjs';
 const before={image:{repository:'ghcr.io/javadevjt/dockerized-imap-sync',tag:'old',pull_policy:'missing'},
  envs:[{name:'IMAP1_PASSWORD',value:'test-only-mail-password'},{name:'OTEL_EXPORTER_OTLP_TRACES_HEADERS',value:'test-only-conflict'}],storage:[]};
 const copy=structuredClone(before),v=makeValues(before,'sha256:'+'a'.repeat(64));
 assert.deepEqual(before,copy);
+assert.equal(configHash(before),configHash({storage:before.storage,envs:before.envs,image:before.image,ix_context:{rendered:'new'}}));
+assert.notEqual(configHash(before),configHash({...before,envs:[{name:'IMAP1_PASSWORD',value:'changed-test-password'}]}));
+assert.notEqual(configHash(before),configHash({...before,ports:[{host_port:9999}]}));
 assert(v.envs.some(x=>x.name==='IMAP1_PASSWORD'&&x.value==='test-only-mail-password'));
 assert(!v.envs.some(x=>x.name==='OTEL_EXPORTER_OTLP_TRACES_HEADERS'));
 assert(v.envs.some(x=>x.name==='OPENWOOF_INGEST_KEY_FILE'&&x.value===CONTAINER_KEY));
@@ -22,5 +25,7 @@ assert(!source.includes('rejectUnauthorized:false'));assert(source.includes("ser
 const bytes=await privateSecret('--test-ipc');assert.equal(bytes.toString(),'synthetic-ipc-token-7b9e2c41');bytes.fill(0);
 const parsed=parseRuntimeOutput('untrusted arbitrary PTY text\r\n{"event":"openwoof.runtime_check","secret_read_only":true}\r\n{"event":"openwoof.validation_receipt","outcome":"success"}\r\nOPENWOOF_VALIDATE_EXIT=0;RUNTIME_EXIT=0\r\n');
 assert.equal(parsed.runtime.secret_read_only,true);assert.equal(parsed.validationExit,0);
+const shutdownIssue=parseRuntimeOutput('{"event":"openwoof.runtime_check"}\n{"event":"openwoof.validation_receipt","outcome":"success"}\ntelemetry exporter reported an issue signal=metrics\nOPENWOOF_VALIDATE_EXIT=0;RUNTIME_EXIT=0');
+assert.deepEqual(shutdownIssue.exporterNotices,['metrics']);
 assert.throws(()=>parseRuntimeOutput('OPENWOOF_VALIDATE_EXIT=0;RUNTIME_EXIT=0'));
 console.log('deployment tests passed: preserved config, fixed path/read-only mount, file ACL guards, pinned TLS, private pipe');

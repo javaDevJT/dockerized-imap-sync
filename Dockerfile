@@ -67,7 +67,7 @@ RUN apk add --no-cache --force-non-repository /tmp/zlib-ng-compat.apk \
 
 COPY --from=imapsync-source /usr/local/bin/imapsync /usr/local/bin/imapsync
 COPY --from=zlib-build /python-packages /opt/otel
-COPY telemetry/runner.py telemetry/requirements.lock /opt/telemetry/
+COPY telemetry/runner.py telemetry/requirements.lock telemetry/ImapTelemetry.pm /opt/telemetry/
 ARG BUILD_REVISION=unknown
 ENV PYTHONPATH=/opt/otel \
     SERVICE_VERSION=2.314-${BUILD_REVISION}

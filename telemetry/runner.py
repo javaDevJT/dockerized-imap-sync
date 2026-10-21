@@ -4,9 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import codecs
+import contextvars
+import ipaddress
 import json
 import logging
 import os
+import re
 import signal
 import stat
 import subprocess
@@ -28,6 +32,297 @@ RUN_INTERVAL_SECONDS = 180.0
 EXPORT_TIMEOUT_SECONDS = 5.0
 FORCE_FLUSH_TIMEOUT_MS = 5_000
 MAX_KEY_BYTES = 4_096
+MAX_REQUEST_EVENT_BYTES = 16_384
+MAX_OUTPUT_LOG_FRAGMENT_BYTES = 16_384
+OUTPUT_READ_SIZE = 4_096
+REQUEST_EVENT_KEYS = frozenset(
+    {
+        "event",
+        "command",
+        "server_role",
+        "server_address",
+        "server_port",
+        "tls",
+        "start_ns",
+        "end_ns",
+        "response_status",
+        "error",
+    }
+)
+REQUEST_COMMANDS = frozenset(
+    {
+        "APPEND", "AUTHENTICATE", "CAPABILITY", "CHECK", "CLOSE", "COMPRESS", "CONNECT", "COPY", "CREATE",
+        "DELETE", "DELETEACL", "ENABLE", "EXAMINE", "EXPUNGE", "FETCH", "GETACL", "GETQUOTA", "GETQUOTAROOT", "ID",
+        "IDLE", "LIST", "LISTRIGHTS", "LOGIN", "LOGOUT", "LSUB", "MOVE", "MYRIGHTS", "NAMESPACE", "NOOP",
+        "NOTIFY", "OTHER", "RENAME", "SEARCH", "SELECT", "SETACL", "SETQUOTA", "SORT", "STARTTLS", "STATUS",
+        "STORE", "SUBSCRIBE", "THREAD", "UID COPY", "UID EXPUNGE", "UID FETCH", "UID MOVE", "UID SEARCH", "UID SORT", "UID STORE", "UID THREAD",
+        "UNSELECT", "UNSUBSCRIBE", "XLIST",
+    }
+)
+REQUEST_ROLES = frozenset({"source", "destination", "unknown"})
+REQUEST_STATUSES = frozenset({"OK", "NO", "BAD", "BYE", "ERROR", "UNKNOWN"})
+SAFE_HOSTNAME_PATTERN = re.compile(r"\A(?=.{1,253}\Z)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)(?:\.(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?))*\Z")
+MAX_SUMMARY_SERVER_ADDRESSES = 8
+
+
+def validate_request_event(value: Any) -> dict[str, Any]:
+    """Validate the private Perl hook event before using it as telemetry data."""
+    if not isinstance(value, dict) or set(value) != REQUEST_EVENT_KEYS:
+        raise ValueError("invalid event shape")
+    if value["event"] != "imap.request":
+        raise ValueError("invalid event name")
+    command = value["command"]
+    if not isinstance(command, str) or command not in REQUEST_COMMANDS:
+        raise ValueError("invalid command")
+    role = value["server_role"]
+    if not isinstance(role, str) or role not in REQUEST_ROLES:
+        raise ValueError("invalid server role")
+    address = value["server_address"]
+    if not isinstance(address, str) or len(address) > 253 or any(ord(char) < 33 or ord(char) > 126 for char in address):
+        raise ValueError("invalid server address")
+    if address.startswith("[") and address.endswith("]"):
+        try:
+            address = str(ipaddress.IPv6Address(address[1:-1]))
+        except ValueError:
+            raise ValueError("invalid server address") from None
+        value = {**value, "server_address": address}
+    if not SAFE_HOSTNAME_PATTERN.fullmatch(address):
+        try:
+            ipaddress.ip_address(address)
+        except ValueError:
+            raise ValueError("invalid server address") from None
+    port = value["server_port"]
+    if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65_535:
+        raise ValueError("invalid server port")
+    if not isinstance(value["tls"], bool):
+        raise ValueError("invalid TLS flag")
+    for field in ("start_ns", "end_ns"):
+        if not isinstance(value[field], int) or isinstance(value[field], bool) or value[field] <= 0:
+            raise ValueError("invalid request time")
+    if value["end_ns"] < value["start_ns"]:
+        raise ValueError("invalid request interval")
+    status = value["response_status"]
+    if not isinstance(status, str) or status not in REQUEST_STATUSES:
+        raise ValueError("invalid response status")
+    if not isinstance(value["error"], bool):
+        raise ValueError("invalid error flag")
+    expected_error = status != "OK" and not (command == "LOGOUT" and status == "BYE")
+    if value["error"] != expected_error:
+        raise ValueError("inconsistent response outcome")
+    return value
+
+
+class StreamingSecretRedactor:
+    """Replace configured secrets across arbitrary pipe read boundaries."""
+
+    def __init__(self, secrets: Sequence[str | bytes]) -> None:
+        encoded = {secret if isinstance(secret, bytes) else secret.encode("utf-8") for secret in secrets if secret}
+        self._secrets = tuple(sorted(encoded, key=len, reverse=True))
+        self._max_secret = max((len(secret) for secret in self._secrets), default=0)
+        self._pending = b""
+
+    def feed(self, chunk: bytes, final: bool = False) -> bytes:
+        data = self._pending + chunk
+        if not self._secrets:
+            self._pending = b""
+            return data
+        output = bytearray()
+        index = 0
+        # Hold only a suffix that could still become a secret, so ordinary log
+        # lines are visible immediately even while the child waits on I/O.
+        while index < len(data):
+            if not final and len(data) - index < self._max_secret:
+                remaining = data[index:]
+                if any(
+                    len(secret) > len(remaining) and secret.startswith(remaining) for secret in self._secrets
+                ):
+                    break
+            match = next((secret for secret in self._secrets if data.startswith(secret, index)), None)
+            if match is not None:
+                output.extend(b"[REDACTED]")
+                index += len(match)
+            else:
+                output.append(data[index])
+                index += 1
+        self._pending = data[index:]
+        if final and self._pending:
+            tail = self._pending
+            self._pending = b""
+            output.extend(self._replace_complete(tail))
+        return bytes(output)
+
+    def _replace_complete(self, data: bytes) -> bytes:
+        for secret in self._secrets:
+            data = data.replace(secret, b"[REDACTED]")
+        return data
+
+
+class ChildOutputPump:
+    """Stream sanitized child output to the console and OTel log bridge."""
+
+    def __init__(
+        self,
+        stream: Any,
+        stream_name: str,
+        level: int,
+        telemetry: Any,
+        console_stream: Any,
+        console_lock: threading.Lock,
+        redactor: StreamingSecretRedactor,
+        summary: MutableMapping[str, int],
+        summary_lock: threading.Lock,
+    ) -> None:
+        self._stream = stream
+        self._stream_name = stream_name
+        self._level = level
+        self._telemetry = telemetry
+        self._console = console_stream
+        self._console_lock = console_lock
+        self._redactor = redactor
+        self._summary = summary
+        self._summary_lock = summary_lock
+        self._line = bytearray()
+        self._previous_was_cr = False
+        self._fragmented_line = False
+        self._console_decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+
+    def run(self) -> None:
+        read_chunk = getattr(self._stream, "read1", self._stream.read)
+        try:
+            while True:
+                chunk = read_chunk(OUTPUT_READ_SIZE)
+                if not chunk:
+                    break
+                self._write_console(self._redactor.feed(chunk))
+            self._write_console(self._redactor.feed(b"", final=True), final=True)
+            if self._line or self._fragmented_line:
+                self._emit_line(bytes(self._line), final=True)
+                self._line.clear()
+                self._fragmented_line = False
+        finally:
+            try:
+                self._stream.close()
+            except Exception:
+                pass
+
+    def _write_console(self, chunk: bytes, final: bool = False) -> None:
+        if not chunk and not final:
+            return
+        text = self._console_decoder.decode(chunk, final=final)
+        with self._console_lock:
+            try:
+                self._console.write(text)
+                self._console.flush()
+            except (BrokenPipeError, OSError, ValueError):
+                pass
+
+        for byte in chunk:
+            if byte in (10, 13):
+                if byte == 10 and self._previous_was_cr:
+                    self._previous_was_cr = False
+                    continue
+                self._emit_line(bytes(self._line), final=False)
+                self._line.clear()
+                self._fragmented_line = False
+                self._previous_was_cr = byte == 13
+            else:
+                self._previous_was_cr = False
+                self._line.append(byte)
+                if len(self._line) >= MAX_OUTPUT_LOG_FRAGMENT_BYTES:
+                    fragment_end = len(self._line)
+                    try:
+                        self._line.decode("utf-8")
+                    except UnicodeDecodeError as error:
+                        if error.reason == "unexpected end of data" and error.end == len(self._line):
+                            fragment_end = error.start
+                    self._emit_line(bytes(self._line[:fragment_end]), final=False, fragment=True)
+                    del self._line[:fragment_end]
+                    self._fragmented_line = True
+
+    def _emit_line(self, raw: bytes, final: bool, fragment: bool = False) -> None:
+        text = raw.decode("utf-8", errors="replace")
+        with self._summary_lock:
+            self._summary[f"{self._stream_name}_lines"] += int(not fragment)
+        try:
+            self._telemetry.emit(
+                self._level,
+                text,
+                {"event": "imapsync.output", "stream": self._stream_name, "line_fragment": fragment, "line_final": final},
+            )
+        except Exception:
+            with self._summary_lock:
+                self._summary["export_failures"] += 1
+
+
+class RequestEventPump:
+    """Read bounded JSON hook events and create real IMAP CLIENT spans."""
+
+    def __init__(
+        self,
+        descriptor: int,
+        telemetry: Any,
+        secrets: Sequence[str],
+        summary: MutableMapping[str, Any],
+        command_counts: MutableMapping[str, int],
+        server_addresses: set[str],
+        server_roles: MutableMapping[str, int],
+        summary_lock: threading.Lock,
+    ) -> None:
+        self._descriptor = descriptor
+        self._telemetry = telemetry
+        self._secrets = tuple(secrets)
+        self._address_redactor = StreamingSecretRedactor(self._secrets)
+        self._summary = summary
+        self._command_counts = command_counts
+        self._server_addresses = server_addresses
+        self._server_roles = server_roles
+        self._summary_lock = summary_lock
+
+    def run(self) -> None:
+        try:
+            with os.fdopen(self._descriptor, "rb", closefd=True) as stream:
+                while True:
+                    raw = stream.readline(MAX_REQUEST_EVENT_BYTES + 1)
+                    if not raw:
+                        return
+                    if len(raw) > MAX_REQUEST_EVENT_BYTES or not raw.endswith(b"\n"):
+                        if not raw.endswith(b"\n"):
+                            while True:
+                                remainder = stream.readline(MAX_REQUEST_EVENT_BYTES + 1)
+                                if not remainder or remainder.endswith(b"\n"):
+                                    break
+                        self._reject()
+                        continue
+                    try:
+                        event = dict(validate_request_event(json.loads(raw)))
+                        address = event["server_address"]
+                        sanitized_address = self._address_redactor.feed(
+                            address.encode("utf-8"), final=True
+                        ).decode("utf-8", errors="replace")
+                        if sanitized_address != address:
+                            event["server_address"] = "redacted"
+                        self._telemetry.record_imap_request(event)
+                        with self._summary_lock:
+                            self._summary["request_spans"] += 1
+                            if event["error"]:
+                                self._summary["request_errors"] += 1
+                            self._command_counts[event["command"]] += 1
+                            self._server_roles[event["server_role"]] += 1
+                            if (
+                                event["server_address"] not in self._server_addresses
+                                and len(self._server_addresses) >= MAX_SUMMARY_SERVER_ADDRESSES
+                            ):
+                                self._summary["server_addresses_omitted"] += 1
+                            else:
+                                self._server_addresses.add(event["server_address"])
+                    except Exception:
+                        self._reject()
+        except OSError:
+            self._reject()
+
+    def _reject(self) -> None:
+        with self._summary_lock:
+            self._summary["malformed_events"] += 1
 
 
 class ConfigurationError(Exception):
@@ -360,6 +655,8 @@ class Telemetry:
     run_duration: Any
     validation_counter: Any
     validation_duration: Any
+    request_counter: Any
+    request_duration: Any
     providers: tuple[tuple[str, Any], ...]
     exporters: tuple[tuple[str, SanitizingExporter], ...]
     notice: ExportNotice
@@ -376,6 +673,44 @@ class Telemetry:
         attributes = {"outcome": outcome}
         self.validation_counter.add(1, attributes)
         self.validation_duration.record(max(0.0, duration), attributes)
+
+    def record_imap_request(self, event: Mapping[str, Any]) -> None:
+        from opentelemetry.trace import SpanKind, Status, StatusCode
+
+        attributes = {
+            "imap.command": event["command"],
+            "imap.server_role": event["server_role"],
+            "server.address": event["server_address"],
+            "server.port": event["server_port"],
+            "imap.tls": event["tls"],
+            "imap.response_status": event["response_status"],
+            "network.protocol.name": "imap",
+            "network.transport": "tcp",
+            "error": event["error"],
+        }
+        span = self.tracer.start_span(
+            f"IMAP {event['command']}",
+            kind=SpanKind.CLIENT,
+            attributes=attributes,
+            start_time=event["start_ns"],
+        )
+        try:
+            span.add_event("imap.command.start", {"imap.command": event["command"]}, timestamp=event["start_ns"])
+            span.add_event("imap.command.response", {"imap.response_status": event["response_status"]}, timestamp=event["end_ns"])
+            if event["error"]:
+                span.set_status(Status(StatusCode.ERROR, "IMAP request failed"))
+        finally:
+            span.end(end_time=event["end_ns"])
+        metric_attributes = {
+            "command": event["command"],
+            "server_role": event["server_role"],
+            "response_status": event["response_status"],
+            "error": event["error"],
+        }
+        self.request_counter.add(1, metric_attributes)
+        self.request_duration.record(
+            max(0.0, (event["end_ns"] - event["start_ns"]) / 1_000_000_000), metric_attributes
+        )
 
     @staticmethod
     def mark_error(span: Any, description: str) -> None:
@@ -421,6 +756,44 @@ class Telemetry:
             "exports": exports,
             "flush_success": flush_success,
             "outcome": "success" if success else "failure",
+        }
+
+    def export_states(self) -> dict[str, dict[str, Any]]:
+        return {name: exporter.state.snapshot() for name, exporter in self.exporters}
+
+    def sync_summary(
+        self,
+        execution: Mapping[str, Any],
+        counts: Mapping[str, Any],
+        flush_success: bool,
+        exports: Mapping[str, Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        export_failures = sum(int(state["failures"]) for state in exports.values())
+        partial_successes = sum(int(state["partial_successes"]) for state in exports.values())
+        return {
+            "event": "imap.telemetry.summary",
+            "trace_id": execution.get("trace_id"),
+            "span_id": execution.get("span_id"),
+            "request_spans": int(counts.get("request_spans", 0)),
+            "request_errors": int(counts.get("request_errors", 0)),
+            "stdout_lines": int(counts.get("stdout_lines", 0)),
+            "stderr_lines": int(counts.get("stderr_lines", 0)),
+            "malformed_events": int(counts.get("malformed_events", 0)),
+            "export_failures": export_failures + int(counts.get("export_failures", 0)),
+            "partial_successes": partial_successes,
+            "command_counts": dict(counts.get("command_counts", {})),
+            "server_addresses": list(counts.get("server_addresses", [])),
+            "server_addresses_omitted": int(counts.get("server_addresses_omitted", 0)),
+            "server_roles": dict(counts.get("server_roles", {})),
+            "export_success": bool(
+                flush_success
+                and bool(exports)
+                and all(state["status"] == "success" and state["flush"] == "success" for state in exports.values())
+            ),
+            "command_exit_code": execution.get("command_exit_code"),
+            "sync_outcome": execution.get("sync_outcome"),
+            "flush_success": bool(flush_success),
+            "exports": {name: dict(state) for name, state in exports.items()},
         }
 
     def shutdown(self) -> None:
@@ -566,6 +939,12 @@ def build_telemetry(ingest_key: str, environ: MutableMapping[str, str] = os.envi
         validation_duration=meter.create_histogram(
             "imap_sync.validation.duration", unit="s", description="Elapsed time for validation runs"
         ),
+        request_counter=meter.create_counter(
+            "imap_sync.imap.requests", unit="{request}", description="Completed IMAP client requests"
+        ),
+        request_duration=meter.create_histogram(
+            "imap_sync.imap.request.duration", unit="s", description="Elapsed time for IMAP client requests"
+        ),
         providers=(
             ("traces", tracer_provider),
             ("metrics", meter_provider),
@@ -587,16 +966,107 @@ class Runner:
         popen: Callable[..., Any] = subprocess.Popen,
         monotonic: Callable[[], float] = time.monotonic,
         wake_event: Any = None,
+        environ: Mapping[str, str] = os.environ,
+        ingest_key: str = "",
+        stdout: Any = None,
+        stderr: Any = None,
     ) -> None:
         self.telemetry = telemetry
         self._popen = popen
         self._monotonic = monotonic
         self._wake_event = wake_event if wake_event is not None else threading.Event()
+        self._environ = environ
+        self._ingest_key = ingest_key
+        self._stdout = stdout if stdout is not None else sys.stdout
+        self._stderr = stderr if stderr is not None else sys.stderr
+        self._output_lock = threading.Lock()
         self._child: Any = None
         self._stop_signal: int | None = None
         self._forwarded_signal: int | None = None
         self._saved_handlers: dict[int, Any] = {}
         self.validation_execution: dict[str, Any] = {}
+        self.sync_execution: dict[str, Any] = {}
+
+    def _child_environment(self, telemetry_fd: int) -> dict[str, str]:
+        environment = dict(self._environ)
+        environment["IMAP_TELEMETRY_FD"] = str(telemetry_fd)
+        perl_options = environment.get("PERL5OPT", "").split()
+        if "-MImapTelemetry" not in perl_options:
+            perl_options.append("-MImapTelemetry")
+        environment["PERL5OPT"] = " ".join(perl_options)
+        perl_libraries = [item for item in environment.get("PERL5LIB", "").split(os.pathsep) if item]
+        if "/opt/telemetry" not in perl_libraries:
+            perl_libraries.append("/opt/telemetry")
+        environment["PERL5LIB"] = os.pathsep.join(perl_libraries)
+        return environment
+
+    def _output_secrets(self) -> list[str]:
+        secrets = [self._ingest_key] if self._ingest_key else []
+        secrets.extend(
+            self._environ.get(name, "")
+            for name in ("IMAP1_USER", "IMAP1_PASSWORD", "IMAP2_USER", "IMAP2_PASSWORD")
+        )
+        return [secret for secret in secrets if secret]
+
+    def _emit_sync_summary(self, counts: Mapping[str, Any], span: Any, success: bool) -> None:
+        span_context = getattr(span, "get_span_context", lambda: None)()
+        valid_context = span_context is not None and getattr(span_context, "is_valid", False)
+        execution = {
+            "trace_id": f"{span_context.trace_id:032x}" if valid_context else None,
+            "span_id": f"{span_context.span_id:016x}" if valid_context else None,
+        }
+        self.sync_execution.update(execution)
+        export_states_method = getattr(self.telemetry, "export_states", None)
+        export_states = export_states_method() if export_states_method is not None else {}
+        export_failures = sum(int(state.get("failures", 0)) for state in export_states.values())
+        partial_successes = sum(int(state.get("partial_successes", 0)) for state in export_states.values())
+        attributes: dict[str, Any] = {
+            "event": "imap.telemetry.summary",
+            "request_spans": int(counts["request_spans"]),
+            "request_errors": int(counts["request_errors"]),
+            "stdout_lines": int(counts["stdout_lines"]),
+            "stderr_lines": int(counts["stderr_lines"]),
+            "malformed_events": int(counts["malformed_events"]),
+            "export_failures": export_failures + int(counts["export_failures"]),
+            "partial_successes": partial_successes,
+            "sync_success": success,
+            "command_counts": json.dumps(counts["command_counts"], sort_keys=True, separators=(",", ":")),
+            "server_addresses": tuple(counts["server_addresses"]),
+            "server_addresses_omitted": int(counts["server_addresses_omitted"]),
+            "server_roles": json.dumps(counts["server_roles"], sort_keys=True, separators=(",", ":")),
+        }
+        if execution["trace_id"]:
+            attributes["trace_id"] = execution["trace_id"]
+            attributes["span_id"] = execution["span_id"]
+        self.telemetry.emit(logging.INFO, "imap.telemetry.summary", attributes)
+
+    def _write_sync_receipt(self, counts: Mapping[str, Any], flush_success: bool) -> None:
+        export_states_method = getattr(self.telemetry, "export_states", None)
+        exports = export_states_method() if export_states_method is not None else {}
+        summary_method = getattr(self.telemetry, "sync_summary", None)
+        if summary_method is not None:
+            receipt = summary_method(self.sync_execution, counts, flush_success, exports)
+        else:
+            receipt = {
+                "event": "imap.telemetry.summary",
+                **self.sync_execution,
+                **{name: int(counts[name]) for name in (
+                    "request_spans", "request_errors", "stdout_lines", "stderr_lines", "malformed_events", "export_failures"
+                )},
+                "partial_successes": 0,
+                "command_counts": dict(counts["command_counts"]),
+                "server_addresses": list(counts["server_addresses"]),
+                "server_addresses_omitted": int(counts["server_addresses_omitted"]),
+                "server_roles": dict(counts["server_roles"]),
+                "export_success": bool(flush_success),
+                "flush_success": bool(flush_success),
+                "exports": exports,
+            }
+        with self._output_lock:
+            try:
+                print(json.dumps(receipt, separators=(",", ":"), sort_keys=True), file=self._stdout, flush=True)
+            except (BrokenPipeError, OSError, ValueError):
+                pass
 
     @property
     def stop_signal(self) -> int | None:
@@ -653,6 +1123,26 @@ class Runner:
         attributes = {"validation.mode": "imapsync_version", "validation.marker": marker} if marker else {"sync.mode": "normal"}
         started = self._monotonic()
         window_start_utc = _utc_timestamp() if validation else None
+        counts: dict[str, Any] = {
+            "request_spans": 0,
+            "request_errors": 0,
+            "stdout_lines": 0,
+            "stderr_lines": 0,
+            "malformed_events": 0,
+            "export_failures": 0,
+            "server_addresses_omitted": 0,
+        }
+        command_counts = {command_name: 0 for command_name in REQUEST_COMMANDS}
+        server_addresses: set[str] = set()
+        server_roles = {role: 0 for role in REQUEST_ROLES}
+        counts_lock = threading.Lock()
+        pump_threads: list[threading.Thread] = []
+        pipe_read_fd: int | None = None
+        pipe_write_fd: int | None = None
+        if not validation:
+            reset_export_results = getattr(self.telemetry, "reset_export_results", None)
+            if reset_export_results is not None:
+                reset_export_results()
         with self.telemetry.tracer.start_as_current_span(span_name, attributes=attributes) as span:
             if marker:
                 span_context = getattr(span, "get_span_context", lambda: None)()
@@ -665,17 +1155,73 @@ class Runner:
                 }
                 self.telemetry.emit(logging.INFO, "validation.started", {"validation_marker": marker})
             else:
+                span_context = getattr(span, "get_span_context", lambda: None)()
+                valid_context = span_context is not None and getattr(span_context, "is_valid", False)
+                self.sync_execution = {
+                    "trace_id": f"{span_context.trace_id:032x}" if valid_context else None,
+                    "span_id": f"{span_context.span_id:016x}" if valid_context else None,
+                }
                 self.telemetry.emit(logging.INFO, "sync.started")
 
             launch_failed = False
             try:
-                child = self._popen(
-                    command,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    close_fds=True,
-                )
+                popen_options: dict[str, Any] = {
+                    "stdin": subprocess.DEVNULL,
+                    "close_fds": True,
+                }
+                if validation:
+                    popen_options["stdout"] = subprocess.DEVNULL
+                    popen_options["stderr"] = subprocess.DEVNULL
+                else:
+                    pipe_read_fd, pipe_write_fd = os.pipe()
+                    popen_options.update(
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        env=self._child_environment(pipe_write_fd),
+                        pass_fds=(pipe_write_fd,),
+                    )
+                child = self._popen(command, **popen_options)
+                if not validation:
+                    assert pipe_read_fd is not None and pipe_write_fd is not None
+                    os.close(pipe_write_fd)
+                    pipe_write_fd = None
+                    context = contextvars.copy_context()
+                    reader = RequestEventPump(
+                        pipe_read_fd,
+                        self.telemetry,
+                        self._output_secrets(),
+                        counts,
+                        command_counts,
+                        server_addresses,
+                        server_roles,
+                        counts_lock,
+                    )
+                    event_thread = threading.Thread(target=context.run, args=(reader.run,), name="imap-request-events")
+                    event_thread.start()
+                    pipe_read_fd = None
+                    for stream, stream_name, level, console_stream in (
+                        (getattr(child, "stdout", None), "stdout", logging.INFO, self._stdout),
+                        (getattr(child, "stderr", None), "stderr", logging.ERROR, self._stderr),
+                    ):
+                        if stream is None:
+                            continue
+                        secrets = self._output_secrets()
+                        pump = ChildOutputPump(
+                            stream,
+                            stream_name,
+                            level,
+                            self.telemetry,
+                            console_stream,
+                            self._output_lock,
+                            StreamingSecretRedactor(secrets),
+                            counts,
+                            counts_lock,
+                        )
+                        output_context = contextvars.copy_context()
+                        thread = threading.Thread(target=output_context.run, args=(pump.run,), name=f"imap-{stream_name}")
+                        thread.start()
+                        pump_threads.append(thread)
+                    pump_threads.append(event_thread)
                 self._child = child
                 self._forward_signal_to_child(child)
             except OSError:
@@ -691,6 +1237,15 @@ class Runner:
                 finally:
                     if self._child is child:
                         self._child = None
+                for thread in pump_threads:
+                    thread.join()
+            finally:
+                for descriptor in (pipe_read_fd, pipe_write_fd):
+                    if descriptor is not None:
+                        try:
+                            os.close(descriptor)
+                        except OSError:
+                            pass
 
             duration = max(0.0, self._monotonic() - started)
             interrupted = self._stop_signal is not None
@@ -726,12 +1281,25 @@ class Runner:
                     )
             if not success:
                 self.telemetry.mark_error(span, "imapsync did not complete successfully")
+            if not validation:
+                self.sync_execution["command_exit_code"] = int(return_code)
+                self.sync_execution["sync_outcome"] = outcome
+                counts["command_counts"] = {
+                    command_name: value for command_name, value in command_counts.items() if value
+                }
+                counts["server_addresses"] = sorted(server_addresses)
+                counts["server_roles"] = dict(server_roles)
+                self._emit_sync_summary(counts, span, success)
 
         if validation:
             self.validation_execution.update(
                 window_end_utc=_utc_timestamp(),
                 command_exit_code=int(return_code),
             )
+        else:
+            force_flush = getattr(self.telemetry, "force_flush", None)
+            flush_success = force_flush() if force_flush is not None else True
+            self._write_sync_receipt(counts, flush_success)
         if interrupted:
             return self._exit_for_signal()
         return int(return_code)
@@ -775,7 +1343,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("telemetry initialization failed", file=sys.stderr)
         return 78
 
-    runner = Runner(telemetry)
+    runner = Runner(telemetry, ingest_key=ingest_key)
     exit_code = 70
     try:
         runner.install_signal_handlers()

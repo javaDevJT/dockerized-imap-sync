@@ -3,7 +3,7 @@
 import { spawn } from 'node:child_process';
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { request } from 'node:https';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { resolve } from 'node:path';
 
@@ -17,6 +17,8 @@ const RECEIPT = resolve(ROOT, 'artifacts/.private-openwoof/preparation.json');
 const HELPER = resolve(ROOT,'artifacts/.private-openwoof/imap-openwoof-keychain');
 const CA = readFileSync(resolve(import.meta.dir, 'truenas-ca.pem'));
 const TLS = {ca:CA, serverName:'localhost', rejectUnauthorized:true};
+const TELEMETRY_ENV={OTEL_EXPORTER_OTLP_ENDPOINT:'https://openwoof.javadevjt.tech',OTEL_EXPORTER_OTLP_PROTOCOL:'http/protobuf',
+  OTEL_SERVICE_NAME:APP,OTEL_RESOURCE_ATTRIBUTES:'service.namespace=mail,deployment.environment.name=production',OPENWOOF_INGEST_KEY_FILE:CONTAINER_KEY};
 export class SafeFailure extends Error {
   constructor(phase, jobId, errno) { super(phase); this.phase=phase; this.jobId=jobId; this.errno=errno; }
 }
@@ -39,7 +41,7 @@ export async function privateSecret(mode, executable=HELPER) {
   return bytes;
 }
 
-export async function connect() {
+export async function connect(onNotification) {
   const key=await privateSecret('read-nas-to-fd');
   const ws=new WebSocket('wss://192.168.0.2:8443/api/current',{tls:TLS});
   const pending=new Map();let next=0;
@@ -48,7 +50,7 @@ export async function connect() {
     pending.set(id,{resolve:resolvePromise,reject,timer,method});ws.send(JSON.stringify({jsonrpc:'2.0',id,method,params}));
   });
   ws.onmessage=e=>{let m;try{m=JSON.parse(String(e.data));}catch{return;}
-    const p=pending.get(m.id);if(!p)return;pending.delete(m.id);clearTimeout(p.timer);
+    const p=pending.get(m.id);if(!p){if(m.method)try{onNotification?.(m);}catch{}return;}pending.delete(m.id);clearTimeout(p.timer);
     m.error?p.reject(new SafeFailure(`rpc-${p.method}`,undefined,m.error.data?.errno??m.error.data?.error)):p.resolve(m.result);
   };
   try {
@@ -67,10 +69,8 @@ async function appState(client) {
 }
 export function makeValues(config,digest) {
   if(!/^sha256:[a-f0-9]{64}$/.test(digest))fail('image-reference');
-  const safe={OTEL_EXPORTER_OTLP_ENDPOINT:'https://openwoof.javadevjt.tech',OTEL_EXPORTER_OTLP_PROTOCOL:'http/protobuf',
-    OTEL_SERVICE_NAME:APP,OTEL_RESOURCE_ATTRIBUTES:'service.namespace=mail,deployment.environment.name=production',OPENWOOF_INGEST_KEY_FILE:CONTAINER_KEY};
   const envs=(config.envs??[]).filter(x=>!x.name.startsWith('OTEL_EXPORTER_OTLP')&&!['OTEL_SERVICE_NAME','OTEL_RESOURCE_ATTRIBUTES','OPENWOOF_INGEST_KEY','OPENWOOF_INGEST_KEY_FILE'].includes(x.name));
-  envs.push(...Object.entries(safe).map(([name,value])=>({name,value})));
+  envs.push(...Object.entries(TELEMETRY_ENV).map(([name,value])=>({name,value})));
   const storage=structuredClone(config.storage??[]);
   if(storage.some(x=>x.mount_path===CONTAINER_KEY))fail('existing-secret-mount');
   storage.push({type:'host_path',read_only:true,mount_path:CONTAINER_KEY,host_path_config:{acl_enable:false,path:HOST_KEY}});
@@ -124,6 +124,17 @@ function receipt() {
   const r=JSON.parse(readFileSync(RECEIPT,'utf8'));
   if(r.app!==APP||r.path!==HOST_KEY)fail('preparation-receipt');return r;
 }
+export function configHash(config) {
+  const canonical=value=>Array.isArray(value)?value.map(canonical):value&&typeof value==='object'?Object.fromEntries(Object.keys(value).sort().map(k=>[k,canonical(value[k])])):value;
+  const stable=Object.fromEntries(Object.entries(config).filter(([k])=>!['ix_context','ix_volumes'].includes(k)));
+  return createHash('sha256').update(JSON.stringify(canonical(stable))).digest('hex');
+}
+async function settledApp(client) {
+  for(let n=0;n<30;n++){
+    try{return await appState(client);}catch(e){if(!(e instanceof SafeFailure)||e.phase!=='app-preflight')throw e;}
+    await Bun.sleep(2000);
+  }fail('app-not-running-after-job');
+}
 async function prepare(client) {
   await appState(client);
   const parent=await client.call('filesystem.stat',['/mnt/Lake']);
@@ -154,12 +165,12 @@ async function deploy(client,digest) {
   const second=await appState(client);if(!isDeepStrictEqual(second.config,before))fail('app-config-drift');
   // Persist the attempt before mutation: a lost reply or failed postcondition
   // must never leave the operation eligible for a blind repeat.
-  const attempt={...r,phase:'deploy-submitted',digest,attemptedAt:new Date().toISOString()};
+  const attempt={...r,phase:'deploy-submitted',digest,expectedConfigHash:configHash({...before,...values}),attemptedAt:new Date().toISOString()};
   saveReceipt(attempt);
   const jobId=await client.call('app.update',[APP,{values}]);
   saveReceipt({...attempt,jobId});
   const result=await job(client,jobId);
-  const after=await appState(client);
+  const after=await settledApp(client);
   for(const [k,v]of Object.entries(before))if(!['image','storage','envs','privileged','ix_context','ix_volumes'].includes(k)&&!isDeepStrictEqual(v,after.config[k]))fail('unrelated-config-drift',result.id);
   if(after.config.privileged!==false)fail('privileged-mode',result.id);
   if(!isDeepStrictEqual(values.image,after.config.image)||!isDeepStrictEqual(values.envs,after.config.envs))fail('telemetry-config-verification',result.id);
@@ -175,6 +186,37 @@ async function deploy(client,digest) {
   saveReceipt({...r,phase:'deployed',digest,jobId:result.id,containerId:containers[0].id,deployedAt:new Date().toISOString()});
   return {app:APP,state:after.state,job:result,image:after.config.image,secretPath:HOST_KEY,mounts,privileged:after.config.privileged,configurationPreservedExceptTelemetryImageAndPrivilegeRemoval:true};
 }
+async function reconcileDeploy(client) {
+  const r=receipt();if(r.phase!=='deploy-submitted'||!Number.isSafeInteger(r.jobId))fail('no-submitted-job');
+  const result=await job(client,r.jobId),app=await settledApp(client),c=app.config;
+  if(c.image?.tag!==`latest@${r.digest}`||c.privileged!==false)fail('reconcile-image-privilege');
+  for(const [name,value] of Object.entries(TELEMETRY_ENV))if(c.envs.filter(x=>x.name===name&&x.value===value).length!==1)fail('reconcile-telemetry-env');
+  const f=await fileState(client);if(!secureFile(f.stat,f.acl))fail('reconcile-secret-file');
+  const mounts=c.storage??[];
+  if(mounts.length!==1||mounts[0].read_only!==true||mounts[0].mount_path!==CONTAINER_KEY||mounts[0].host_path_config?.path!==HOST_KEY)fail('reconcile-storage');
+  if(r.expectedConfigHash&&configHash(c)!==r.expectedConfigHash)fail('reconcile-config-fingerprint');
+  const containers=app.active_workloads?.container_details??[];
+  if(containers.length!==1||containers[0].state!=='running'||containers[0].image!==`ghcr.io/javadevjt/dockerized-imap-sync:latest@${r.digest}`)fail('reconcile-runtime-image');
+  saveReceipt({...r,phase:'deployed',containerId:containers[0].id,reconciledAt:new Date().toISOString()});
+  return {app:APP,state:app.state,job:result,digest:r.digest,containerId:containers[0].id,privileged:false,secretReadOnlyConfigured:true,
+    completeConfigFingerprintVerified:!!r.expectedConfigHash,reconciledWithoutMutation:true};
+}
+async function deployImage(client,digest) {
+  if(!/^sha256:[a-f0-9]{64}$/.test(digest))fail('image-reference');
+  const r=receipt();if(r.phase!=='deployed')fail('previous-deployment-not-verified');
+  const app=await appState(client),before=app.config;
+  if(before.image.tag!==`latest@${r.digest}`)fail('previous-image-drift');
+  const f=await fileState(client);if(!secureFile(f.stat,f.acl))fail('secret-not-ready');
+  const image={...before.image,tag:`latest@${digest}`};
+  const second=await appState(client);if(!isDeepStrictEqual(second.config,before))fail('app-config-drift');
+  const {validation,validatedAt,jobId:previousJobId,...previous}=r;
+  const attempt={...previous,previousJobId,previousDigest:r.digest,previousValidation:validation,previousValidatedAt:validatedAt,
+    phase:'deploy-submitted',digest,expectedConfigHash:configHash({...before,image}),attemptedAt:new Date().toISOString()};
+  saveReceipt(attempt);
+  const jobId=await client.call('app.update',[APP,{values:{image}}]);saveReceipt({...attempt,jobId});
+  await job(client,jobId);
+  return await reconcileDeploy(client);
+}
 
 export function parseRuntimeOutput(output) {
   const records=[];
@@ -186,7 +228,8 @@ export function parseRuntimeOutput(output) {
   const validation=records.find(x=>x.event==='openwoof.validation_receipt');
   const exit=output.match(/OPENWOOF_VALIDATE_EXIT=(\d+);RUNTIME_EXIT=(\d+)/);
   if(!runtime||!validation||!exit)fail('runtime-receipt-incomplete');
-  return {runtime,validation,validationExit:Number(exit[1]),runtimeExit:Number(exit[2])};
+  const exporterNotices=[...new Set([...output.matchAll(/telemetry exporter reported an issue signal=(traces|metrics|logs)/g)].map(x=>x[1]))];
+  return {runtime,validation,validationExit:Number(exit[1]),runtimeExit:Number(exit[2]),exporterNotices};
 }
 async function validateRuntime(client) {
   const r=receipt();if(r.phase!=='deployed')fail('deployment-not-recorded');
@@ -220,7 +263,7 @@ async function validateRuntime(client) {
 if(import.meta.main){
   const mode=process.argv[2];let client;
   try {
-    if(!['inspect','inspect-parents','inspect-secrets','prepare','prompt-and-deliver','deploy','validate-runtime'].includes(mode))fail('usage');
+    if(!['inspect','inspect-parents','inspect-secrets','prepare','prompt-and-deliver','deploy','deploy-image','reconcile-deploy','validate-runtime'].includes(mode))fail('usage');
     client=await connect();let result;
     if(mode==='inspect'){const a=await appState(client);result={app:a.id,state:a.state,image:a.config.image,environmentNames:a.config.envs.map(x=>x.name),storage:a.config.storage};}
     if(mode==='inspect-secrets'){result=[];for(const path of [DIRECTORY,HOST_KEY]){try{const s=await client.call('filesystem.stat',[path]);result.push({path,exists:true,uid:s.uid,gid:s.gid,mode:s.mode,size:s.size,type:s.type,inode:s.inode});}catch(e){result.push({path,exists:false,phase:e.phase,errno:e.errno});}}}
@@ -228,7 +271,9 @@ if(import.meta.main){
     if(mode==='prepare')result=await prepare(client);
     if(mode==='prompt-and-deliver')result=await deliver(client);
     if(mode==='deploy')result=await deploy(client,process.argv[3]);
-    if(mode==='validate-runtime'){result=await validateRuntime(client);if(result.runtimeExit!==0||result.validationExit!==0||result.validation.outcome!=='success')process.exitCode=1;}
+    if(mode==='deploy-image')result=await deployImage(client,process.argv[3]);
+    if(mode==='reconcile-deploy')result=await reconcileDeploy(client);
+    if(mode==='validate-runtime'){result=await validateRuntime(client);if(result.runtimeExit!==0||result.validationExit!==0||result.validation.outcome!=='success'||result.exporterNotices.length)process.exitCode=1;}
     console.log(JSON.stringify(result));
   }catch(e){console.error(JSON.stringify({phase:e instanceof SafeFailure?e.phase:'internal',jobId:e.jobId??null,errno:e.errno??null}));process.exitCode=1;}
   finally{client?.close();}

@@ -25,7 +25,7 @@ Credential custody verified: Keychain service `openwoof/openwoof.javadevjt.tech/
 
 Security refinement: the existing app has `privileged=true`. The scoped update will set it to false to honor the user's explicit prohibition on privileged containers, while preserving all unrelated app values, mailbox credentials, ports, and existing data. The app's normal sync requires no privileged mode.
 
-Exporter integration correction: dependency download and hash verification succeeded in the isolated private environment. A primary test against the real official SDK caught an incorrect metrics result import that fake unit tests missed. The exporter worker is correcting that API use, metric exporter wrapper compatibility, partial-success/error evidence, and a nonsecret validation receipt. No instrumented app deployment or successful export is claimed before these checks pass.
+Exporter integration correction: dependency download and hash verification succeeded in the isolated private environment. A primary test against the real official SDK caught an incorrect metrics result import that fake unit tests missed. The worker corrected that API use, metric exporter wrapper compatibility, partial-success/error evidence, and the nonsecret validation receipt.
 
 Exporter correction accepted; `/root/openwoof_exporter` released through native completion. Primary reviewed the TLS/auth/environment clearing, SDK lifecycle, response partial-success parsing, correlation and nonsecret receipt paths. All 14 tests passed against the installed official SDK; `pip check` reported no broken requirements. The image build also runs these same tests through a read-only BuildKit source mount, without shipping tests or making external requests. The legacy health entrypoint and both build provenance fields remain intact.
 
@@ -58,3 +58,159 @@ Local checks passed so far: Swift compilation and synthetic secret IPC tests,
 deployment preservation/TLS/ACL/receipt tests, workflow YAML parsing, existing
 health/entrypoint syntax checks and whitespace validation. Build context excludes
 operator tooling, `.git` and private artifacts.
+
+Source `9ca0b5db9d80be9f31f964d5250233e4d9a0b173` was committed and pushed.
+Image validation run: [39517764816, attempt 1](https://github.com/javaDevJT/dockerized-imap-sync/actions/runs/39517764816).
+Semgrep run `39517764844` passed. Prior runtime `/healthz` returned HTTP 200,
+`status=ok`, source `15664c418e78837a54d7c7612313f6f26a14caba`.
+Image publication, new-runtime validation and owner persisted readback remain
+separate pending gates until their evidence is recorded below.
+
+## Runtime and publication evidence
+
+Publisher job `118953931705` passed, including all 14 real-SDK tests in Alpine,
+Grype High/Critical gate and tag publication. Retained security report:
+`highCriticalCount=0`, no findings, exact source above, image
+`sha256:63fd1db64f4a46f3e3fb67fa8a6234a7eb79cd3aac7dce89cec6acfb10ab64fa`.
+Authenticated GitHub package metadata confirms `latest` and `sha-9ca0b5d` both
+name that digest; anonymous GHCR reads require authentication. Storage completed
+under the runner's current approved ordinary-job policy with a warning:
+7,046,754,304-byte peak (6.5628 GiB), 9,663,676,416-byte allocation (9 GiB),
+72.9200% utilization. This change did not weaken the runner's policy.
+
+Quarterback was rechecked at `2026-10-21T00:03:11.530Z`: IMAP remained paused,
+unfrozen and without an active transaction. One native `app.update`, job `28708`,
+completed successfully. Its immediate app-state read lagged job completion; the
+operation was reconciled read-only, without a second update. The app is RUNNING
+at the expected digest, nonprivileged, with the fixed read-only secret mount,
+original port and network. Complete pre/post configuration fingerprint proof
+was unavailable for this first attempt because the original in-memory preflight
+ended on that transient read and TrueNAS redacts job values; the scoped submitted
+patch preserved existing IMAP entries by construction. Known configuration,
+protected-file, mount and runtime invariants were independently rechecked.
+The helper now waits for settled app state and saves an expected configuration
+fingerprint before any future mutation; its read-only `reconcile-deploy` mode
+cannot submit another update.
+
+Container `94e37bb3474342256c8d3e541aa2291a10979c32574018e1da0584ec569d3ee3`
+passed the deployed validation. `/healthz` returned HTTP 200 and exact source
+`9ca0b5db9d80be9f31f964d5250233e4d9a0b173` before and after validation.
+The actual secret mount is read-only; file owner/mode checks pass; the ongoing
+SDK process remains alive; SDK `1.45.1`, service version
+`2.314-9ca0b5db9d80be9f31f964d5250233e4d9a0b173`.
+
+Bounded workload: only `imapsync --version`, exit 0. UTC window
+`2026-10-21T00:06:26.762Z`–`2026-10-21T00:06:27.673Z`.
+Marker: `openwoof-validation-86a6523449a4484a84a7ccd1dd3f5158`.
+Trace: `c6af76d96049f7cc1e3e2317ac6ff249`; span: `1a323a7c534b4db5`.
+Each signal reported one successful export and flush, zero failures and zero
+partial successes; no sanitized exporter notices, including during shutdown.
+Actual metric instruments: `imap_sync.runner.uptime`, `imap_sync.runs`,
+`imap_sync.run.duration`, `imap_sync.validation.runs`,
+`imap_sync.validation.duration`. Only validation instruments and uptime are
+expected from the bounded workload; normal-run instruments describe the
+continuing existing sync process. Marker labels are not added to metrics.
+
+Persisted trace/log/metric/APM readback is still pending owner Authentik sign-in.
+The user supplied an ingest key instead of authorizing the blocked Google
+redirect, so no alternate authentication path was used. Successful export
+receipts establish upstream acceptance, not persisted owner readback.
+
+CI cleanup demand investigator `/root/ci_cleanup_demand`: accepted and released
+through native completion. The controller gets GitHub scale-set messages, not
+REST workflow pagination; monitor `desiredRunnerCount` is an assigned-runner
+target, not queue depth. Source labels and job dependencies match. Live cause
+of delayed cleanup remained unproven. Later readback showed an IMAP 8-GiB worker
+in cleanup-pending state and shared memory capacity pressure. No infrastructure,
+registrations or unrelated jobs were changed/cancelled.
+
+## User correction: preserve detailed application logs
+
+The first telemetry release suppressed imapsync's detailed stdout/stderr and
+replaced it with curated lifecycle events. The user explicitly rejected that
+unrequested change. Restore detailed live container output and bridge the same
+application log lines to OpenWoof, with credential/account redaction and trace
+correlation. Retain the existing timing, flags, exit/signal behavior and bounded
+validation boundary. Preserve the earlier release/export evidence as history;
+it does not establish acceptance of the corrected logging behavior.
+
+The user also requires real IMAP request/response traces. The initial spans only
+measured the sync process and do not satisfy that requirement. Instrument the
+actual deployed Mail::IMAPClient command/response path; do not manufacture
+server-side spans or export command arguments/message content. Use the official
+Python SDK to export real child-process request events through a private pipe.
+Observe normal app traffic; do not add extra mailbox syncs or live test suites.
+
+Exporter worker `/root/openwoof_exporter` is assigned a same-scope correction,
+owning `telemetry/runner.py`, Python tests and `telemetry/README.md`, excluding
+the Perl hook and its tests. Consumer: primary logging
+integration and redeployment. Use the same native `gpt-6-luna`/`max` policy;
+no credentials, live email operations, deployments, commits or redelegation.
+Release after real-SDK correlation and stream-preservation test handoff.
+
+IMAP hook worker (queued): owns only `telemetry/ImapTelemetry.pm` and dedicated
+Perl-hook tests. Consumer: exporter worker's actual CLIENT request spans. Audit
+the current Mail::IMAPClient command/response API, emit allowlisted metadata and
+real start/end/status events over an inherited private descriptor, preserving
+all original return values/exceptions and avoiding content/credential emission.
+No other source ownership, credentials, live mail, app operations, commits or
+redelegation. Same native `gpt-6-luna`/`max`; release after focused handoff.
+
+Both correction workers completed and released their files. Seventeen Python
+tests pass; actual-client tests initially skipped because the Mac lacks
+Mail::IMAPClient. Primary is installing only checksum-verified official 3.43
+source into the ignored private test library to run the full loopback seam.
+Checksum: `093c97fac15b47a8fe4d2936ef2df377abf77cc8ab74092d2128bb945d1fb46f`.
+
+IMAP semantics reviewer (queued): read-only independent check of the completed
+hook and stream importer for changed Perl call semantics, broken continuation
+handling, false request status/timing or credential/content leakage. Consumer:
+primary integration. No edits, credentials, external services or redelegation;
+same native `gpt-6-luna`/`max`. Release after focused source-backed findings.
+
+Primary's isolated actual-client run executed all 20 tests without skips after
+fixing the original `connect(@)` prototype and retaining the test library path.
+It also caught that detailed text must be the OTLP log body, not a generic body
+with a text attribute; that is corrected and asserted. Request span names now
+show the actual allowlisted IMAP command with timed command/response events.
+Independent review then found missing SASL completion and premature IDLE
+completion; these are assigned back to the hook owner with loopback regression
+coverage before any corrected release is published.
+
+Primary corrected the importer to reject contradictory status/error pairs and
+normalize bracketed IPv6 addresses. Detailed log text is the actual OTLP body;
+streaming redaction releases ordinary lines immediately and preserves UTF-8
+across pipe reads and log fragments. Focused runner checks pass. Deployment
+reconciliation now records the complete expected configuration fingerprint
+before an image-only update, without carrying a prior job ID into a new attempt.
+
+Read-only compatibility inspection of the local OpenWoof source found that APM
+operation groups use observed span names, while dependency edges require spans
+from two distinct observed services. The real IMAP CLIENT operations will carry
+the mail-server address, timing and response status in the trace. This app does
+not control the remote email servers and does not synthesize their server spans
+or invent a cross-service dependency edge. This source inspection is not a
+deployed owner-UI readback.
+
+Correction handoff accepted with primary integration fixes. Hook worker
+`/root/imap_request_hooks` and independent reviewer `/root/imap_semantics_review`
+completed and released through native completion. Primary verified the vendor's
+`LastError` setter intentionally updates `$@`, then preserved the original call's
+actual `$@` and errno instead of reconstructing either from `LastError`.
+Primary fixed the mounted test-directory path and the `_send_bytes($)` prototype,
+and added deterministic APPEND literal-write failure coverage. The real client
+continues to own its return values, errors and protocol handling.
+
+All 26 tests pass without skips against the checksum-verified Mail::IMAPClient
+3.43 and official SDK: normal requests and responses, refused connection,
+AUTHENTICATE final tagged rejection, IDLE unsolicited update through DONE,
+APPEND refusal and literal-write failure, real SDK correlation/exports, detailed
+log bodies, streaming redaction, timing and signals. The protocol fixtures use
+only loopback; SDK HTTP is mocked. Deployment/Keychain focused checks and
+whitespace checks pass. The corrected image still requires CI/publication and
+normal-traffic runtime proof; the first release's validation is not reused.
+
+The initial image workflow `39517764816` ultimately completed successfully,
+including its delayed cleanup. No unrelated jobs were cancelled. Keychain's
+attributes-only lookup was freshly rechecked and still reports the continuing
+`imap-sync` credential present.
