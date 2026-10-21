@@ -214,3 +214,93 @@ The initial image workflow `39517764816` ultimately completed successfully,
 including its delayed cleanup. No unrelated jobs were cancelled. Keychain's
 attributes-only lookup was freshly rechecked and still reports the continuing
 `imap-sync` credential present.
+
+## Corrected image qualification
+
+Correction source `b58b8c4d68600bb465840c974a5f1811783d8a4a` was committed and
+pushed. [Build run 39523358713, attempt 1](https://github.com/javaDevJT/dockerized-imap-sync/actions/runs/39523358713),
+publisher job `118972214576`, passed all 26 tests inside the image without skips,
+the vulnerability gate, tag publication, and runner completion. Semgrep run
+`39523358676` passed. The retained exact-source Grype summary contains no
+findings and `highCriticalCount=0`.
+
+Published immutable digest:
+`sha256:0428edaa981c3b7e429dd65b3c5a1bbf146d9d6064e22cf1520173312c59c90b`.
+Authenticated GitHub package metadata independently confirms `sha-b58b8c4` and
+`latest` both name this digest. Private bounded scan evidence and the publisher
+log are retained under `artifacts/.private-openwoof/ci-39523358713/`.
+
+Actual BuildKit peak: 7,047,389,184 bytes (6.563393 GiB), allocation
+9,663,676,416 bytes (9 GiB), utilization 72.926585%. The current runner policy
+accepted the ordinary job with an efficiency warning; it did not meet an 80%
+utilization target. No storage/security policy was weakened by this correction.
+Cleanup job `118975139938` passed; the entire workflow is SUCCESS.
+
+Native app preflight showed the first telemetry image and the protected
+read-only secret mount. Final owner readback at `2026-10-21T00:59:43.713Z` confirms IMAP
+autopilot remains disabled/paused, unfrozen, with no active transaction.
+
+## Corrected runtime evidence
+
+Native image-only update job `28827` completed SUCCESS. Container
+`97ea073508dec1966f0a7df9a4f749137038e2cd3b87d0dad7c91cedcb3bab74` runs the
+qualified `0428edaa…` digest above. The complete expected configuration
+fingerprint matched after the update: credentials, environment, port, storage
+and all other stable app values were preserved. Privileged mode remains off;
+the continuing key remains root-owned mode 0600 and actually mounted read-only.
+`/healthz` returned HTTP 200/status ok and exact source `b58b8c4d…`.
+
+The deployed check confirms the Perl hook is present, the ongoing SDK runner
+is alive, SDK `1.45.1`, service version
+`2.314-b58b8c4d68600bb465840c974a5f1811783d8a4a`. Bounded validation invoked
+only `imapsync --version`, exit 0, from `2026-10-21T01:01:24.956Z` through
+`2026-10-21T01:01:25.925Z`. Marker
+`openwoof-validation-11a89db4430646abbd3dd496a2ebdac8`; trace
+`12048e29433dd3f793cebab811ef2fd0`; span `106af73fe181facf`.
+Traces, metrics and logs each exported and flushed successfully, with zero
+failures, partial successes or sanitized exporter notices, including shutdown.
+
+The existing normal sync then completed successfully; no additional mailbox
+sync or live test suite was invoked. Native bounded log readback at
+`2026-10-21T01:02:50.277Z` returned this real-traffic summary:
+
+| Observation | Result |
+| --- | --- |
+| Trace | `c4e4ff9fffdfa0194028f767e76924ab` |
+| Sync span | `3b5d23f2afcef67a` |
+| Actual IMAP CLIENT exchanges | 203 |
+| Source `imap.mail.yahoo.com` | 99 |
+| Destination `imap.gmail.com` | 104 |
+| Unknown server roles | 0 |
+| Request errors / malformed hook events | 0 / 0 |
+| Detailed stdout / stderr lines | 467 / 0 |
+| Child exit / sync outcome | 0 / success |
+| Export failures / partial successes | 0 / 0 |
+| Traces, metrics, logs export and flush | All success |
+
+Observed commands: CONNECT 2, LOGIN 2, CAPABILITY 4, EXPUNGE 34,
+GETQUOTAROOT 1, ID 2, LIST 23, LOGOUT 2, LSUB 2, NAMESPACE 4,
+SELECT 36, STATUS 17, UID FETCH 38, UID SEARCH 36. These are events from the
+real Mail::IMAPClient protocol path and actual server replies, not a process
+timer or synthetic server activity. Each CLIENT span carries its server,
+command, timed command/response events, response status and error outcome.
+The same detailed sanitized application lines become OTLP log bodies with the
+active sync trace/span IDs. Actual request metric names are
+`imap_sync.imap.requests` and `imap_sync.imap.request.duration`, alongside the
+run/validation/uptime instruments listed earlier.
+
+The bounded native readback contained 289 detailed operational lines and no
+configured credential matches or exporter warnings. Raw mailbox/application
+logs were processed in memory and were not printed or saved by the observer.
+The credential remains available for continuing export; no key was replaced,
+rotated, revoked or deleted.
+
+Persisted owner trace/log/metric/APM readback remains pending. Automatic approval
+review previously rejected the separate Google sign-in destination; the user's
+ingest token does not grant UI/query access. No alternate authentication path
+was used. The normal-run receipts establish real traffic capture and accepted
+exports, not independently verified persisted owner readback. IMAP autopilot
+remains paused; reconcile its saved baseline before any future owner-authorized
+resume. All native workers completed and released; the CI watch exited
+successfully. Final post-sync `/healthz` readback at `2026-10-21T01:03:30.262Z`
+remained HTTP 200/status ok with exact correction source `b58b8c4d…`.

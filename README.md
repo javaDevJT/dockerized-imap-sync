@@ -69,6 +69,9 @@ The image includes the pinned official OpenTelemetry Python SDK. Set
 `OPENWOOF_INGEST_KEY_FILE` to an owner-readable, read-only mounted secret file
 to enable traces, operational logs and metrics for the existing sync loop.
 The destination is `https://openwoof.javadevjt.tech` over verified HTTPS.
+Detailed imapsync output appears in both container logs and OTLP log bodies,
+with configured credentials redacted. Real IMAP command/response CLIENT spans
+record the source or destination server, timing and returned status.
 Without that setting, the original shell loop remains available.
 
 See [telemetry configuration and safe validation](telemetry/README.md) and the
