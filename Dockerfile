@@ -57,6 +57,7 @@ RUN apk add --no-cache --force-non-repository /tmp/zlib-ng-compat.apk \
         perl-unicode-string \
         procps-ng \
         python3 \
+        'sqlite-libs>3.54.1-r0' \
     && apk add --no-cache --force-non-repository /tmp/posix-shell.apk \
     && apk del busybox busybox-binsh ssl_client \
     && rm /tmp/zlib-ng-compat.apk /tmp/posix-shell.apk \
@@ -74,7 +75,7 @@ ENV PYTHONPATH=/opt/otel \
 RUN --mount=type=bind,source=telemetry,target=/tmp/telemetry-tests,readonly \
     perl -e 'die "Perl 5.44 or newer required\n" unless $^V ge v5.44.0' \
     && perl -e 'my @rss = qx{ps -o rss -p $$}; shift @rss; die "ps RSS check failed\n" unless @rss == 1 && $rss[0] =~ /^\s*\d+\s*$/' \
-    && perl -MCompress::Zlib -e 'die "compression round trip failed" unless Compress::Zlib::uncompress(Compress::Zlib::compress("imapsync")) eq "imapsync"' \
+    && perl -MCompress::Zlib -e 'die "compression round trip failed\n" unless Compress::Zlib::uncompress(Compress::Zlib::compress("imapsync")) eq "imapsync"' \
     && imapsync --version \
     && imapsync --help >/dev/null \
     && python3 -c 'from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter; from opentelemetry.sdk._logs import LoggerProvider; from opentelemetry.instrumentation.logging.handler import LoggingHandler; from opentelemetry.sdk.metrics import MeterProvider' \
