@@ -57,6 +57,7 @@ RUN apk add --no-cache --force-non-repository /tmp/zlib-ng-compat.apk \
         perl-unicode-string \
         procps-ng \
         python3 \
+        'sqlite-libs>3.54.1-r0' \
     && apk add --no-cache --force-non-repository /tmp/posix-shell.apk \
     && apk del busybox busybox-binsh ssl_client \
     && rm /tmp/zlib-ng-compat.apk /tmp/posix-shell.apk \
