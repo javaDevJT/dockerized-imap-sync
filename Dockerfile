@@ -22,7 +22,15 @@ RUN abuild-keygen -a -n \
     && cd /src/posix-shell \
     && REPODEST=/packages abuild -F -r \
     && cp /packages/*/*/posix-shell-*.apk /posix-shell.apk \
-    && python3 -m pip install --no-cache-dir --no-compile --require-hashes \
+    && cd /src/telemetry-python \
+    && REPODEST=/packages abuild -F -r -K \
+    && cp /packages/*/*/imap-telemetry-python-*.apk /imap-telemetry-python.apk \
+    && python3 -c 'import sys, sysconfig; assert sys.version_info[:3] == (3, 14, 10); assert sysconfig.get_config_var("SOABI").startswith("cpython-314-")' \
+    && PYTHONHOME=/src/telemetry-python/pkg/imap-telemetry-python/usr/lib/imap-telemetry-python \
+       PYTHONPATH=/usr/lib/python3.14/site-packages \
+       LD_LIBRARY_PATH=/src/telemetry-python/pkg/imap-telemetry-python/usr/lib/imap-telemetry-python/lib \
+       PATH="/src/telemetry-python/pkg/imap-telemetry-python/usr/lib/imap-telemetry-python/bin:$PATH" \
+       python3 -m pip install --no-cache-dir --no-compile --require-hashes \
         --target /python-packages -r /src/requirements.lock
 
 FROM ${ALPINE_IMAGE}
@@ -30,12 +38,13 @@ FROM ${ALPINE_IMAGE}
 COPY --from=zlib-build /etc/apk/keys/ /etc/apk/keys/
 COPY --from=zlib-build /zlib-ng-compat.apk /tmp/zlib-ng-compat.apk
 COPY --from=zlib-build /posix-shell.apk /tmp/posix-shell.apk
+COPY --from=zlib-build /imap-telemetry-python.apk /tmp/imap-telemetry-python.apk
 # zlib-ng supplies the same libz ABI without zlib's vulnerable gz_vacate code.
 # Keep the replacement as an APK so the SBOM records its real name and version.
 RUN apk add --no-cache --force-non-repository /tmp/zlib-ng-compat.apk \
     && apk del zlib \
     && apk upgrade --no-cache \
-    && apk add --no-cache \
+    && apk add --no-cache --force-non-repository \
         bash \
         ca-certificates \
         coreutils \
@@ -56,12 +65,14 @@ RUN apk add --no-cache --force-non-repository /tmp/zlib-ng-compat.apk \
         perl-test-simple \
         perl-unicode-string \
         procps-ng \
-        python3 \
+        /tmp/imap-telemetry-python.apk \
     && apk add --no-cache --force-non-repository /tmp/posix-shell.apk \
     && apk del busybox busybox-binsh ssl_client \
-    && rm /tmp/zlib-ng-compat.apk /tmp/posix-shell.apk \
+    && rm /tmp/zlib-ng-compat.apk /tmp/posix-shell.apk /tmp/imap-telemetry-python.apk \
     && apk info --exists zlib-ng-compat \
     && apk info | perl -ne 'die "unexpected zlib or BusyBox package\n" if /^zlib$/ || /^busybox(?:-|$)/ || /^ssl_client$/' \
+    && apk info | perl -ne 'die "unexpected SQLite APK in runtime\n" if /sqlite/i' \
+    && test ! -e /usr/lib/libsqlite3.so.0 \
     && test "$(readlink /bin/sh)" = /bin/bash \
     && /bin/sh -ec 'test "$((180 - 1))" -eq 179; date +%s >/dev/null; sleep 0'
 
@@ -69,7 +80,8 @@ COPY --from=imapsync-source /usr/local/bin/imapsync /usr/local/bin/imapsync
 COPY --from=zlib-build /python-packages /opt/otel
 COPY telemetry/runner.py telemetry/requirements.lock telemetry/ImapTelemetry.pm /opt/telemetry/
 ARG BUILD_REVISION=unknown
-ENV PYTHONPATH=/opt/otel \
+ENV PATH=/usr/lib/imap-telemetry-python/bin:$PATH \
+    PYTHONPATH=/opt/otel \
     SERVICE_VERSION=2.314-${BUILD_REVISION}
 RUN --mount=type=bind,source=telemetry,target=/tmp/telemetry-tests,readonly \
     perl -e 'die "Perl 5.44 or newer required\n" unless $^V ge v5.44.0' \
@@ -77,7 +89,9 @@ RUN --mount=type=bind,source=telemetry,target=/tmp/telemetry-tests,readonly \
     && perl -MCompress::Zlib -e 'die "compression round trip failed" unless Compress::Zlib::uncompress(Compress::Zlib::compress("imapsync")) eq "imapsync"' \
     && imapsync --version \
     && imapsync --help >/dev/null \
-    && python3 -c 'from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter; from opentelemetry.sdk._logs import LoggerProvider; from opentelemetry.instrumentation.logging.handler import LoggingHandler; from opentelemetry.sdk.metrics import MeterProvider' \
+    && python3 -c 'import importlib.util, sys; assert sys.version_info[:3] == (3, 14, 10); assert importlib.util.find_spec("_sqlite3") is None; assert importlib.util.find_spec("sqlite3") is None; assert importlib.util.find_spec("dbm.sqlite3") is None; from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter; from opentelemetry.sdk._logs import LoggerProvider; from opentelemetry.instrumentation.logging.handler import LoggingHandler; from opentelemetry.sdk.metrics import MeterProvider' \
+    && if command -v sqlite3 >/dev/null 2>&1; then echo "unexpected SQLite CLI in runtime" >&2; exit 1; fi \
+    && printf '%s\n' 'import sys; assert sys.version_info[:3] == (3, 14, 10); print(sys.version_info[:3])' | python3 - \
     && PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s /tmp/telemetry-tests -p 'test_*.py'
 
 USER root

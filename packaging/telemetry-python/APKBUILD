@@ -1,0 +1,71 @@
+pkgname=imap-telemetry-python
+pkgver=3.14.10
+pkgrel=0
+pkgdesc="CPython telemetry runtime without SQLite modules"
+url="https://www.python.org/"
+arch="aarch64 x86_64"
+license="PSF-2.0"
+makedepends="bzip2-dev expat-dev libffi-dev mpdecimal-dev ncurses-dev openssl-dev readline-dev xz-dev zlib-dev"
+source="Python-$pkgver.tar.xz::https://www.python.org/ftp/python/$pkgver/Python-$pkgver.tar.xz"
+builddir="$srcdir/Python-$pkgver"
+
+prepare() {
+	default_prepare
+	# Keep this module out even if a later build dependency introduces SQLite headers.
+	printf '%s\n' '*disabled*' '_sqlite3' > Modules/Setup.local
+}
+
+build() {
+	LDFLAGS="$LDFLAGS -Wl,-rpath,/usr/lib/imap-telemetry-python/lib" ./configure \
+		--prefix=/usr/lib/imap-telemetry-python \
+		--with-platlibdir=lib \
+		--enable-shared \
+		--with-ensurepip=no \
+		--disable-test-modules
+	make -j"${JOBS:-2}"
+}
+
+check() {
+	LD_LIBRARY_PATH="$PWD${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ./python -S -c \
+		'import importlib.util, ssl, zlib; assert importlib.util.find_spec("_sqlite3") is None'
+}
+
+package() {
+	make DESTDIR="$pkgdir" install
+	runtime="$pkgdir/usr/lib/imap-telemetry-python"
+	rm -rf "$runtime/include" \
+		"$runtime/lib/python3.14/sqlite3" \
+		"$runtime/lib/python3.14/dbm/sqlite3.py" \
+		"$runtime/lib/python3.14/config-3.14-"* \
+		"$runtime/share/man"
+	# CPython installs this global site-packages marker outside our private prefix.
+	# Leaving it behind makes abuild infer a dependency on Alpine's python3 package.
+	rm -rf "$pkgdir/usr/lib/python3.14"
+	find "$runtime" -type f -name '*.pyc' -exec rm -f '{}' \;
+	find "$runtime" -depth -type d -name __pycache__ -exec rmdir '{}' \;
+	rm -f "$runtime/bin/"*config \
+		"$runtime/bin/"idle3* \
+		"$runtime/bin/"pydoc3* \
+		"$runtime/lib/libpython3.14.a" \
+		"$runtime/lib/pkgconfig/"python3*.pc \
+		"$runtime/lib/pkgconfig/"python-3.14*.pc
+	if find "$runtime/lib/python3.14" -name '_sqlite3*.so' -print -quit | grep -q .; then
+		echo "_sqlite3 was built into the telemetry runtime" >&2
+		exit 1
+	fi
+	if [ -e "$runtime/lib/python3.14/sqlite3" ] || [ -e "$runtime/lib/python3.14/dbm/sqlite3.py" ] || [ -e "$pkgdir/usr/bin/sqlite3" ]; then
+		echo "SQLite files were packaged into the telemetry runtime" >&2
+		exit 1
+	fi
+	if [ -e "$pkgdir/usr/bin/python3" ] || [ -e "$pkgdir/usr/bin/python3.14" ]; then
+		echo "the private Python runtime must not claim Alpine's global commands" >&2
+		exit 1
+	fi
+	PYTHONHOME="$runtime" \
+	LD_LIBRARY_PATH="$runtime/lib" \
+		"$runtime/bin/python3" -c 'import importlib.util, sys; assert sys.version_info[:3] == (3, 14, 10); assert importlib.util.find_spec("_sqlite3") is None; assert importlib.util.find_spec("sqlite3") is None; assert importlib.util.find_spec("dbm.sqlite3") is None'
+}
+
+sha512sums="
+730ea64f7e8815a5e1a4280b1205d77719875de630e6807b3140987b44e7b91215918cf75ed77250cf6feb5de98ff4175555cbba96eaf32564d2f421e723994a  Python-3.14.10.tar.xz
+"

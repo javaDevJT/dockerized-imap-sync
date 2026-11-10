@@ -310,6 +310,7 @@ class RunnerTests(unittest.TestCase):
         session.request("POST", "https://openwoof.javadevjt.tech/v1/traces")
 
         self.assertEqual(state.snapshot()["partial_successes"], 1)
+        self.assertEqual(state.snapshot()["rejected_items"], 2)
         self.assertIn("signal=traces", stream.getvalue())
         self.assertNotIn("private account text", stream.getvalue())
 

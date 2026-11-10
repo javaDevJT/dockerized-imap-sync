@@ -24,7 +24,20 @@ The exporter destination is fixed at `https://openwoof.javadevjt.tech` using
 OTLP HTTP/protobuf, with standard TLS certificate verification enabled. The
 runner clears generic and signal-specific endpoint, protocol, header, TLS, and
 timeout overrides before constructing the exporters. It sends traces, metrics,
-and logs directly through the Python SDK exporters.
+and logs directly through the Python SDK exporters. Explicit
+`OTEL_RESOURCE_ATTRIBUTES` are percent-decoded and applied to all three
+signals. The fixed service identity takes precedence for `service.name`,
+`service.namespace`, and `deployment.environment.name`. No host detector runs;
+`host.name` is present only when explicitly supplied.
+
+Trace and log processors use queues capped at 2,048 records and batches capped
+at 512 records. The runner temporarily enables the pinned SDK's
+`OTEL_PYTHON_SDK_INTERNAL_METRICS_ENABLED` option while constructing processors,
+then restores its prior environment value. The processor queue and drop metrics
+are exported through the existing metrics provider. OTLP requests use a
+five-second timeout. A permanent collector failure is reported after the
+SDK's bounded retry attempts; redirects and partial-success responses fail
+export, and rejected-item counts remain visible per signal.
 
 Each normal run gets an `imap.sync` span and curated lifecycle logs. The runner
 streams the child's detailed stdout and stderr back to the container as they are
@@ -53,13 +66,15 @@ emitted after SDK force-flush and contains hex trace/span IDs, request/error and
 output-line counts, `command_counts` keyed only by the hook's fixed IMAP verb
 allowlist (including `OTHER`), a validated unique `server_addresses` list,
 fixed `server_roles` counts, malformed-event and exporter-failure counts,
-partial-success count, `export_success`, child exit/outcome, flush outcome, and
-per-signal export states. The address list is capped at eight entries and reports
-any omitted entries with `server_addresses_omitted`. Exporters remain active
+aggregate partial-success and rejected-item counts, per-signal partial/rejected
+counts, `export_success`, child exit/outcome, flush outcome, and per-signal
+export states. The address list is capped at eight entries and reports omitted
+entries with `server_addresses_omitted`. Exporters remain active
 between syncs. Low-cardinality run outcome counters, run duration histograms,
 request counters/histograms, and a process uptime gauge share the stable
 resource identity `service.name=imap-sync`, `service.namespace=mail`, and
-`deployment.environment.name=production`. `SIGTERM` and `SIGINT` are forwarded
+`deployment.environment.name=production`. `service.version` comes from the
+validated `SERVICE_VERSION` value. `SIGTERM` and `SIGINT` are forwarded
 to the active child process, and the next run remains scheduled 180 seconds
 after the previous run started. A failed run exits with its status so the
 container restart policy can act.
@@ -72,13 +87,20 @@ python3 /opt/telemetry/runner.py --validate
 
 This mode starts the SDK, invokes only `/usr/local/bin/imapsync --version`, and
 emits a fresh `openwoof-validation-…` marker on the validation span and its
-correlated log. It records validation metrics, force-flushes each provider and
-exporter with a five-second timeout per flush, and shuts down the providers. It
-prints one JSON receipt
-with the marker, trace/span IDs, UTC window, per-signal export and flush status,
+correlated log. It records validation metrics, requests a five-second force
+flush from each provider and exporter, and shuts down the providers. It
+prints one JSON receipt with the marker, trace/span IDs, UTC window, per-signal export and flush status,
 and an overall outcome; the command exits nonzero if validation or telemetry
 export fails. Exporter problems produce a rate-limited, sanitized stderr notice;
 the runner never prints exporter response bodies or credential values.
+
+Final provider shutdown starts each provider on a daemon worker and shares a
+five-second total wait budget. The pinned trace and log processor shutdown
+methods have no timeout argument, so queued telemetry may remain unflushed when
+that budget expires. Metrics provider shutdown receives a five-second timeout.
+The pinned batch processor's force-flush call does not enforce its timeout
+across multiple batches; the bounded queue and per-request exporter timeout
+limit the amount of work it can drain.
 
 Run the focused local checks with:
 
@@ -96,7 +118,13 @@ checks through a mocked HTTP session. It verifies validation trace/log
 correlation, a real client request span parented to the sync span, sanitized
 child output in console and OTLP logs, request and output summary counts,
 request metrics, metric export, TLS verification defaults, the bearer header,
-and that partial success produces a failed validation receipt without exposing
-server text. The unit tests for secret handling, event validation, streaming
-redaction, timing, signals, and child-process behavior remain runnable without
-the OpenTelemetry packages.
+resource attributes on all signals, processor queue limits and self-metrics,
+bounded shutdown with a blocked fake collector, bounded retries after HTTP 503,
+rejection of redirects, and partial-success/rejected counts without exposing
+server text. The loopback `Mail::IMAPClient` 3.43 cases cover CONNECT and
+command completion, AUTHENTICATE continuations, IDLE/DONE, server BYE and
+transport EOF, APPEND rejection and literal-write failure, and preservation of
+client errors. Supply the pinned Perl module through the local private artifact
+or `PERL5LIB`; otherwise these real-client checks are skipped. The unit tests
+for secret handling, event validation, streaming redaction, timing, signals, and
+child-process behavior remain runnable without the OpenTelemetry packages.

@@ -386,6 +386,7 @@ sub _install_hooks {
     my $original_send_line = \&Mail::IMAPClient::_send_line;
     my $original_send_bytes = \&Mail::IMAPClient::_send_bytes;
     my $original_get_response = \&Mail::IMAPClient::_get_response;
+    my $original_idle_data = \&Mail::IMAPClient::idle_data;
     my $original_read_line = \&Mail::IMAPClient::_read_line;
     my $original_command_do = \&Mail::IMAPClient::_imap_command_do;
     my $original_connect = \&Mail::IMAPClient::connect;
@@ -436,21 +437,50 @@ sub _install_hooks {
     *Mail::IMAPClient::_get_response = sub {
         my $want = wantarray;
         my @args = @_;
+        my $self = $args[0];
         my $tag_index = @args > 1 && ref($args[1]) eq 'HASH' ? 2 : 1;
         my $tag = @args > $tag_index ? $args[$tag_index] : undef;
-        if ($want) {
-            my @result = $original_get_response->(@args);
-            _response_received($args[0], $result[0], $tag);
-            return @result;
+        my $call = _invoke_original($original_get_response, $want, \@args, $@, $!);
+        if (!$call->{ok}) {
+            my $pending = $PENDING{$self};
+            if ($pending && $pending->{command} =~ /\A(?:AUTHENTICATE|IDLE)\z/) {
+                _finish_pending($self, $pending->{command}, 'ERROR');
+            }
+            _restore_call_state($call);
         }
-        if (defined $want) {
-            my $result = $original_get_response->(@args);
-            _response_received($args[0], $result, $tag);
-            return $result;
+
+        my $status = $want
+            ? (@{$call->{list_result}} ? $call->{list_result}[0] : undef)
+            : $call->{scalar_result};
+        _response_received($self, $status, $tag);
+        if (!defined($status)
+            && $PENDING{$self}
+            && $PENDING{$self}{command} eq 'IDLE') {
+            _finish_pending($self, 'IDLE', 'ERROR');
         }
-        $original_get_response->(@args);
-        _response_received($args[0], undef, $tag);
-        return;
+        _restore_call_state($call);
+        return _return_call($call, $want);
+    };
+
+    *Mail::IMAPClient::idle_data = sub {
+        my $want = wantarray;
+        my @args = @_;
+        my $self = $args[0];
+        my $call = _invoke_original($original_idle_data, $want, \@args, $@, $!);
+        if (!$call->{ok}) {
+            _finish_pending($self, 'IDLE', 'ERROR');
+            _restore_call_state($call);
+        }
+
+        my $failed = $want
+            ? (@{$call->{list_result}} == 1 && !defined($call->{list_result}[0]))
+            : defined($want)
+                ? !defined($call->{scalar_result})
+                : 0;
+        _finish_pending($self, 'IDLE', 'ERROR') if $failed;
+
+        _restore_call_state($call);
+        return _return_call($call, $want);
     };
 
     *Mail::IMAPClient::_read_line = sub {
