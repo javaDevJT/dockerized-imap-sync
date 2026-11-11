@@ -304,3 +304,90 @@ remains paused; reconcile its saved baseline before any future owner-authorized
 resume. All native workers completed and released; the CI watch exited
 successfully. Final post-sync `/healthz` readback at `2026-10-21T01:03:30.262Z`
 remained HTTP 200/status ok with exact correction source `b58b8c4d…`.
+
+## Current source checkpoint — 2026-11-08
+
+This is a local source qualification on the exact release worktree at
+`0bdd50fdcae0ccab0eeee26b5d796894870f14ab`. It records a minimal telemetry
+delta and its isolated checks; it is not a new image, deployment, or persisted
+owner readback. The app's top-level `README.md` already indexes this artifact.
+
+### Source and configuration delta
+
+- The IMAP hook now closes pending AUTHENTICATE/IDLE spans on actual client
+  exceptions and undefined IDLE EOF results while preserving the original
+  return value, `$@`, `$!`, `LastError`, and protocol flow. CONNECT, AUTH, IDLE,
+  DONE, and APPEND instrumentation remains in place.
+- Trace and log processor queues are capped at 2,048 records and batches at
+  512 records. Processor self-metrics are enabled during SDK construction and
+  exported through the existing meter provider; the previous environment value
+  is restored afterward.
+- OTLP 3xx responses fail export. Partial-success and rejected-item totals are
+  retained per signal and included in the summary. Export request timeout stays
+  five seconds. Provider shutdown runs concurrently on daemon workers with one
+  five-second total wait budget; pinned trace/log shutdown calls have no timeout
+  argument, while metrics provider shutdown receives a five-second timeout.
+- Key handling is unchanged: the runner reads one secret from the mounted
+  `OPENWOOF_INGEST_KEY_FILE` path and creates the bearer header in memory. No
+  key value was read into this record. The endpoint remains
+  `https://openwoof.javadevjt.tech/v1/{traces,metrics,logs}`, using OTLP
+  HTTP/protobuf with standard TLS verification.
+- Resources now retain explicit, percent-decoded `OTEL_RESOURCE_ATTRIBUTES`
+  across traces, metrics, and logs. Fixed identity still wins for
+  `service.name=imap-sync`, `service.namespace=mail`, and
+  `deployment.environment.name=production`; `service.version` uses the
+  validated `SERVICE_VERSION`. No default host/process detector runs, so
+  `host.name` appears only if explicitly configured.
+
+Implementation source SHA-256:
+
+| File | SHA-256 |
+| --- | --- |
+| `telemetry/ImapTelemetry.pm` | `bedd7edbb84d6d6303e2fa1ee6a2abcb312f272b45d9827f55a42eff2eef1d5b` |
+| `telemetry/runner.py` | `d2f0e2c3f9c4dad30ccfeca8896e976318dcf7716f4e7596662bb975fd771b0e` |
+
+### Local verification receipt
+
+- Reused `/Users/joshuaterk/.codex/verification/openwoof-20261108/imap-venv`
+  with Python 3.15.2. All 20 distributions matched
+  `telemetry/requirements.lock` (SHA-256
+  `860b67c431895498f52e0c9ae78c2a2b9dddf7ec3c60afb8c93c004bafffd76a`);
+  OpenTelemetry SDK was 1.45.1.
+- Working directory:
+  `/Users/joshuaterk/.codex/worktrees/openwoof-improvements-20261108/apps/imap`.
+- Executed `/Users/joshuaterk/.codex/verification/openwoof-20261108/imap-venv/bin/python -m unittest discover -s telemetry -p 'test_*.py' -v`, with
+  `PERL5LIB` set to the exact pinned client module path below. Result: **33
+  tests passed, zero skipped, zero failed, 0.647 seconds**.
+- Real-client fake-protocol tests loaded Mail::IMAPClient 3.43 from
+  `/Users/joshuaterk/Documents/ChatGPT/dockerized-imap-sync/artifacts/.private-openwoof/Mail-IMAPClient-3.43/lib`.
+  `Mail/IMAPClient.pm` SHA-256:
+  `cc4537b8d34623d96fd4d248f475e01bcf36b478efd5d4e21a25fc7cd4720675`.
+  The 10-file module tree (1,174,885 bytes) has SHA-256
+  `16e08642c2f4f7d6d83f6d9f36b06cb4e33fda88e7d6f3f1b9aebf8dcb091cf6` when
+  computed over sorted relative paths and their file SHA-256 values. The donor
+  tree was read-only and was not copied, reinstalled, or modified.
+- The real-client loopback suite exercised CONNECT, AUTHENTICATE continuation,
+  IDLE/DONE, BYE cancellation, transport EOF, and APPEND rejection/write
+  failure. The BYE case finishes the IDLE span with response `BYE` and error
+  true without exposing response text; transport EOF finishes with `ERROR`
+  while preserving the client's original `LastError`.
+- The mocked collector verified all three signals retain explicit resource
+  attributes and the fixed service name wins. With test queue capacity two and
+  one-record batches, blocked first exports plus six inputs retained the
+  in-flight record and newest two queued records for traces and logs. A blocked
+  trace export did not hold runner shutdown past the injected 100 ms shared
+  budget; releasing the fake request allowed provider shutdown to finish.
+- A permanent HTTP 503 produced six bounded requests, one failed trace export,
+  and successful metrics/log exports; each request timeout was positive and at
+  most five seconds. A 308 produced one request with redirects disabled and one
+  failed trace export. Partial success reported one rejected span as `partial`.
+  These paths emitted sanitized notices without collector response text.
+- No mailbox or real collector traffic occurred. `git diff --check` passed; no
+  CI, commit, push, deployment, key change, or NAS action occurred.
+
+Primary integration also exercised an isolated real-SDK subprocess with a fake
+transport blocked indefinitely. With a 100 ms fixture-only shutdown budget,
+`Telemetry.shutdown()` returned and the process exited successfully within a
+four-second ceiling; SDK exit handlers did not reintroduce a shutdown hang.
+Production retains the five-second shared budget. No source change was needed
+for this additional lifecycle check, and no network request was sent.

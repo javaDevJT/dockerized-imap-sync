@@ -21,6 +21,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping, MutableMapping, Sequence
+from urllib.parse import unquote
 
 
 OTLP_BASE_ENDPOINT = "https://openwoof.javadevjt.tech"
@@ -30,7 +31,12 @@ RUN_COMMAND = ("/usr/local/bin/run-imapsync",)
 VALIDATION_COMMAND = ("/usr/local/bin/imapsync", "--version")
 RUN_INTERVAL_SECONDS = 180.0
 EXPORT_TIMEOUT_SECONDS = 5.0
+EXPORT_TIMEOUT_MILLIS = 5_000
 FORCE_FLUSH_TIMEOUT_MS = 5_000
+PROCESSOR_SHUTDOWN_TIMEOUT_MS = 5_000
+BATCH_SCHEDULE_DELAY_MILLIS = 5_000
+PROCESSOR_MAX_QUEUE_SIZE = 2_048
+PROCESSOR_MAX_EXPORT_BATCH_SIZE = 512
 MAX_KEY_BYTES = 4_096
 MAX_REQUEST_EVENT_BYTES = 16_384
 MAX_OUTPUT_LOG_FRAGMENT_BYTES = 16_384
@@ -329,6 +335,10 @@ class ConfigurationError(Exception):
     """A configuration error with a deliberately non-sensitive message."""
 
 
+class UnexpectedOTLPRedirect(Exception):
+    """An OTLP redirect is not a successful export because redirects are disabled."""
+
+
 def read_ingest_key(environ: Mapping[str, str] = os.environ) -> str:
     """Read the configured secret once, without following symlinks or echoing it."""
     path = environ.get("OPENWOOF_INGEST_KEY_FILE", "")
@@ -449,6 +459,7 @@ class ExportState:
             self.successes = 0
             self.failures = 0
             self.partial_successes = 0
+            self.rejected_items = 0
             self.provider_flush: str | None = None
             self.exporter_flush: str | None = None
 
@@ -464,9 +475,10 @@ class ExportState:
         with self._lock:
             self.failures += 1
 
-    def record_partial_success(self) -> None:
+    def record_partial_success(self, rejected_items: int = 0) -> None:
         with self._lock:
             self.partial_successes += 1
+            self.rejected_items += max(0, int(rejected_items))
 
     def record_provider_flush(self, success: bool) -> None:
         with self._lock:
@@ -498,6 +510,7 @@ class ExportState:
                 "successes": self.successes,
                 "failures": self.failures,
                 "partial_successes": self.partial_successes,
+                "rejected_items": self.rejected_items,
                 "flush": flush,
             }
 
@@ -532,7 +545,12 @@ class PartialSuccessSession:
 
     def request(self, method: str, url: str, **kwargs: Any) -> Any:
         response = self._session.request(method=method, url=url, **kwargs)
-        if response.status_code != 200 or not response.content:
+        status_code = response.status_code
+        if isinstance(status_code, int) and 300 <= status_code < 400:
+            self._state.record_failure()
+            self._notice.report(self._signal_name)
+            raise UnexpectedOTLPRedirect(f"OTLP export redirected (HTTP {status_code})")
+        if status_code != 200 or not response.content:
             return response
         try:
             decoded = self._response_type()
@@ -544,8 +562,9 @@ class PartialSuccessSession:
 
         if decoded.HasField("partial_success"):
             partial = decoded.partial_success
-            if getattr(partial, self._rejected_field) > 0 or partial.error_message:
-                self._state.record_partial_success()
+            rejected_items = int(getattr(partial, self._rejected_field))
+            if rejected_items > 0 or partial.error_message:
+                self._state.record_partial_success(rejected_items)
                 self._notice.report(self._signal_name)
         return response
 
@@ -612,9 +631,11 @@ class SanitizingExporter:
             self._notice.report(self._signal_name)
         return success
 
-    def shutdown(self, *args: Any, **kwargs: Any) -> Any:
+    def shutdown(self, timeout_millis: int | None = None) -> Any:
         try:
-            return self._exporter.shutdown(*args, **kwargs)
+            # The pinned OTLP exporters have a no-argument shutdown. Exposing
+            # the timeout here lets the batch processor bound its worker join.
+            return self._exporter.shutdown()
         except Exception:
             self._notice.report(self._signal_name)
             return None
@@ -658,6 +679,7 @@ class Telemetry:
     request_counter: Any
     request_duration: Any
     providers: tuple[tuple[str, Any], ...]
+    processors: tuple[tuple[str, Any], ...]
     exporters: tuple[tuple[str, SanitizingExporter], ...]
     notice: ExportNotice
 
@@ -770,6 +792,7 @@ class Telemetry:
     ) -> dict[str, Any]:
         export_failures = sum(int(state["failures"]) for state in exports.values())
         partial_successes = sum(int(state["partial_successes"]) for state in exports.values())
+        rejected_items = sum(int(state.get("rejected_items", 0)) for state in exports.values())
         return {
             "event": "imap.telemetry.summary",
             "trace_id": execution.get("trace_id"),
@@ -781,6 +804,7 @@ class Telemetry:
             "malformed_events": int(counts.get("malformed_events", 0)),
             "export_failures": export_failures + int(counts.get("export_failures", 0)),
             "partial_successes": partial_successes,
+            "rejected_items": rejected_items,
             "command_counts": dict(counts.get("command_counts", {})),
             "server_addresses": list(counts.get("server_addresses", [])),
             "server_addresses_omitted": int(counts.get("server_addresses_omitted", 0)),
@@ -797,10 +821,32 @@ class Telemetry:
         }
 
     def shutdown(self) -> None:
+        deadline = time.monotonic() + PROCESSOR_SHUTDOWN_TIMEOUT_MS / 1000
+        shutdown_threads: list[tuple[str, threading.Thread]] = []
+
         for signal_name, provider in self.providers:
-            try:
-                provider.shutdown()
-            except Exception:
+            def shutdown_provider(current_signal: str = signal_name, current_provider: Any = provider) -> None:
+                try:
+                    if current_signal == "metrics":
+                        current_provider.shutdown(timeout_millis=PROCESSOR_SHUTDOWN_TIMEOUT_MS)
+                    else:
+                        # The pinned trace/log processor shutdown APIs have no
+                        # timeout argument, so isolate their joins below.
+                        current_provider.shutdown()
+                except Exception:
+                    self.notice.report(current_signal)
+
+            thread = threading.Thread(
+                target=shutdown_provider,
+                name=f"imap-telemetry-shutdown-{signal_name}",
+                daemon=True,
+            )
+            thread.start()
+            shutdown_threads.append((signal_name, thread))
+
+        for signal_name, thread in shutdown_threads:
+            thread.join(max(0.0, deadline - time.monotonic()))
+            if thread.is_alive():
                 self.notice.report(signal_name)
 
 
@@ -809,6 +855,18 @@ def _service_version(environ: Mapping[str, str]) -> str:
     if not value or len(value) > 128 or any(not (char.isalnum() or char in "._+-") for char in value):
         return "unknown"
     return value
+
+
+def _parse_resource_attributes(environ: Mapping[str, str]) -> dict[str, str]:
+    """Preserve explicit OTel resource attributes without running detectors."""
+    raw = environ.get("OTEL_RESOURCE_ATTRIBUTES", "")
+    attributes: dict[str, str] = {}
+    for pair in raw.split(","):
+        key, separator, value = pair.partition("=")
+        if not separator or not key:
+            continue
+        attributes[unquote(key)] = unquote(value)
+    return attributes
 
 
 def _utc_timestamp() -> str:
@@ -842,6 +900,7 @@ def build_telemetry(ingest_key: str, environ: MutableMapping[str, str] = os.envi
     # identity or environment-provided attributes to this service.
     resource = Resource(
         {
+            **_parse_resource_attributes(environ),
             "service.name": "imap-sync",
             "service.namespace": "mail",
             "deployment.environment.name": "production",
@@ -894,20 +953,42 @@ def build_telemetry(ingest_key: str, environ: MutableMapping[str, str] = os.envi
         LogRecordExportResult.FAILURE,
     )
 
-    tracer_provider = TracerProvider(resource=resource)
-    tracer_provider.add_span_processor(
-        BatchSpanProcessor(span_exporter, schedule_delay_millis=5_000, export_timeout_millis=5_000)
-    )
-    meter_reader = PeriodicExportingMetricReader(
-        metric_exporter,
-        export_interval_millis=60_000,
-        export_timeout_millis=5_000,
-    )
-    meter_provider = MeterProvider(resource=resource, metric_readers=[meter_reader])
-    logger_provider = LoggerProvider(resource=resource)
-    logger_provider.add_log_record_processor(
-        BatchLogRecordProcessor(log_exporter, schedule_delay_millis=5_000, export_timeout_millis=5_000)
-    )
+    sdk_metrics_flag = "OTEL_PYTHON_SDK_INTERNAL_METRICS_ENABLED"
+    previous_sdk_metrics_flag = os.environ.get(sdk_metrics_flag)
+    os.environ[sdk_metrics_flag] = "true"
+    try:
+        meter_reader = PeriodicExportingMetricReader(
+            metric_exporter,
+            export_interval_millis=60_000,
+            export_timeout_millis=EXPORT_TIMEOUT_MILLIS,
+        )
+        meter_provider = MeterProvider(resource=resource, metric_readers=[meter_reader])
+
+        tracer_provider = TracerProvider(resource=resource)
+        span_processor = BatchSpanProcessor(
+            span_exporter,
+            schedule_delay_millis=BATCH_SCHEDULE_DELAY_MILLIS,
+            max_queue_size=PROCESSOR_MAX_QUEUE_SIZE,
+            max_export_batch_size=PROCESSOR_MAX_EXPORT_BATCH_SIZE,
+            export_timeout_millis=EXPORT_TIMEOUT_MILLIS,
+            meter_provider=meter_provider,
+        )
+        tracer_provider.add_span_processor(span_processor)
+        logger_provider = LoggerProvider(resource=resource)
+        log_processor = BatchLogRecordProcessor(
+            log_exporter,
+            schedule_delay_millis=BATCH_SCHEDULE_DELAY_MILLIS,
+            max_queue_size=PROCESSOR_MAX_QUEUE_SIZE,
+            max_export_batch_size=PROCESSOR_MAX_EXPORT_BATCH_SIZE,
+            export_timeout_millis=EXPORT_TIMEOUT_MILLIS,
+            meter_provider=meter_provider,
+        )
+        logger_provider.add_log_record_processor(log_processor)
+    finally:
+        if previous_sdk_metrics_flag is None:
+            os.environ.pop(sdk_metrics_flag, None)
+        else:
+            os.environ[sdk_metrics_flag] = previous_sdk_metrics_flag
 
     root_logger = logging.getLogger()
     root_logger.handlers.clear()
@@ -949,6 +1030,10 @@ def build_telemetry(ingest_key: str, environ: MutableMapping[str, str] = os.envi
             ("traces", tracer_provider),
             ("metrics", meter_provider),
             ("logs", logger_provider),
+        ),
+        processors=(
+            ("traces", span_processor),
+            ("logs", log_processor),
         ),
         exporters=(
             ("traces", span_exporter),
@@ -1020,6 +1105,7 @@ class Runner:
         export_states = export_states_method() if export_states_method is not None else {}
         export_failures = sum(int(state.get("failures", 0)) for state in export_states.values())
         partial_successes = sum(int(state.get("partial_successes", 0)) for state in export_states.values())
+        rejected_items = sum(int(state.get("rejected_items", 0)) for state in export_states.values())
         attributes: dict[str, Any] = {
             "event": "imap.telemetry.summary",
             "request_spans": int(counts["request_spans"]),
@@ -1029,12 +1115,20 @@ class Runner:
             "malformed_events": int(counts["malformed_events"]),
             "export_failures": export_failures + int(counts["export_failures"]),
             "partial_successes": partial_successes,
+            "rejected_items": rejected_items,
             "sync_success": success,
             "command_counts": json.dumps(counts["command_counts"], sort_keys=True, separators=(",", ":")),
             "server_addresses": tuple(counts["server_addresses"]),
             "server_addresses_omitted": int(counts["server_addresses_omitted"]),
             "server_roles": json.dumps(counts["server_roles"], sort_keys=True, separators=(",", ":")),
         }
+        for signal_name, state in export_states.items():
+            attributes[f"otel.exporter.{signal_name}.partial_successes"] = int(
+                state.get("partial_successes", 0)
+            )
+            attributes[f"otel.exporter.{signal_name}.rejected_items"] = int(
+                state.get("rejected_items", 0)
+            )
         if execution["trace_id"]:
             attributes["trace_id"] = execution["trace_id"]
             attributes["span_id"] = execution["span_id"]
@@ -1054,6 +1148,7 @@ class Runner:
                     "request_spans", "request_errors", "stdout_lines", "stderr_lines", "malformed_events", "export_failures"
                 )},
                 "partial_successes": 0,
+                "rejected_items": 0,
                 "command_counts": dict(counts["command_counts"]),
                 "server_addresses": list(counts["server_addresses"]),
                 "server_addresses_omitted": int(counts["server_addresses_omitted"]),

@@ -31,6 +31,11 @@ matching XS modules; the stable Alpine 3.24 package still fails the scan gate.
 A build stage packages zlib-ng 2.3.3 with the compatible zlib ABI to replace
 the vulnerable zlib library. Build tools and signing private keys remain in
 the build stage.
+The image packages the official CPython 3.14.10 source as a distinct
+`imap-telemetry-python` APK under `/usr/lib/imap-telemetry-python` without
+SQLite modules or the SQLite CLI. The container puts that private interpreter
+on `PATH`. Its `python3` stdin contract and locked OpenTelemetry imports are
+checked in the image build. See the [runtime package recipe](packaging/telemetry-python/README.md).
 The runtime retains APK package metadata for SBOM and vulnerability scanning.
 Bash and GNU core utilities provide the shell and scheduling commands; BusyBox
 is removed from the runtime. A signed shell-provider package owns `/bin/sh`.

@@ -658,6 +658,87 @@ print "imap-idle-hook-test-ok\n";
         self.assertEqual([event["response_status"] for event in events], ["OK", "OK"])
         self.assertEqual([event["error"] for event in events], [False, False])
 
+    def test_idle_bye_cancellation_finishes_error_span(self) -> None:
+        def respond(connection, stream, requests, server_errors) -> None:
+            raw = stream.readline(4096)
+            line = raw.decode("ascii", errors="replace").rstrip("\r\n")
+            parts = line.split(" ", 2)
+            if len(parts) < 2 or parts[1].upper() != "IDLE":
+                server_errors.append("expected IDLE request")
+                return
+            requests.append("IDLE")
+            connection.sendall(b"+ idling\r\n")
+            import time
+            time.sleep(0.05)
+            connection.sendall(f"* BYE {RESPONSE_SENTINEL}\r\n".encode("ascii"))
+
+        server, host, port, requests, server_errors, thread = self._start_scenario_server(respond)
+        script = r'''use strict;
+use warnings;
+use Mail::IMAPClient;
+
+my ($host, $port) = @ARGV;
+my $imap = Mail::IMAPClient->new(Server => $host, Port => $port, Timeout => 3)
+    or die "client setup failed\n";
+my $count = $imap->idle;
+die "IDLE continuation failed\n" unless $count;
+eval { $imap->idle_data(2); 1 };
+print "imap-idle-cancel-test-ok\n";
+'''
+        returncode, stdout, stderr, events = self._run_hook_script(host, port, script)
+        thread.join(timeout=8)
+
+        self.assertEqual((returncode, stdout, stderr), (0, "imap-idle-cancel-test-ok\n", ""))
+        self.assertFalse(thread.is_alive(), "loopback server did not finish")
+        self.assertEqual(server_errors, [])
+        self.assertEqual(requests, ["IDLE"])
+        self.assertEqual([event["command"] for event in events], ["CONNECT", "IDLE"])
+        self.assertEqual([event["response_status"] for event in events], ["OK", "BYE"])
+        self.assertEqual([event["error"] for event in events], [False, True])
+        self.assertNotIn(RESPONSE_SENTINEL, json.dumps(events))
+
+    def test_idle_transport_exception_finishes_pending_error_span(self) -> None:
+        def respond(connection, stream, requests, server_errors) -> None:
+            raw = stream.readline(4096)
+            line = raw.decode("ascii", errors="replace").rstrip("\r\n")
+            parts = line.split(" ", 2)
+            if len(parts) < 2 or parts[1].upper() != "IDLE":
+                server_errors.append("expected IDLE request")
+                return
+            requests.append("IDLE")
+            connection.sendall(b"+ idling\r\n")
+            import time
+            time.sleep(0.05)
+            connection.shutdown(socket.SHUT_RDWR)
+
+        server, host, port, requests, server_errors, thread = self._start_scenario_server(respond)
+        script = r'''use strict;
+use warnings;
+use Mail::IMAPClient;
+
+my ($host, $port) = @ARGV;
+my $imap = Mail::IMAPClient->new(Server => $host, Port => $port, Timeout => 3)
+    or die "client setup failed\n";
+my $count = $imap->idle;
+die "IDLE continuation failed\n" unless $count;
+eval { $imap->idle_data(2); 1 };
+my $last_error = $imap->LastError;
+die "transport error was not retained\n"
+    unless defined($last_error) && $last_error =~ /socket closed while reading data from server/;
+print "imap-idle-read-ended\n";
+'''
+        returncode, stdout, stderr, events = self._run_hook_script(host, port, script)
+        thread.join(timeout=8)
+
+        self.assertEqual(returncode, 0, msg=f"stdout={stdout!r}, stderr={stderr!r}")
+        self.assertEqual(stdout, "imap-idle-read-ended\n")
+        self.assertFalse(thread.is_alive(), "loopback server did not finish")
+        self.assertEqual(server_errors, [])
+        self.assertEqual(requests, ["IDLE"])
+        self.assertEqual([event["command"] for event in events], ["CONNECT", "IDLE"])
+        self.assertEqual(events[-1]["response_status"], "ERROR")
+        self.assertTrue(events[-1]["error"])
+
     def test_append_file_write_failure_closes_pending_event(self) -> None:
         def respond(connection, stream, requests, server_errors) -> None:
             line = stream.readline(4096).decode("ascii").rstrip("\r\n")

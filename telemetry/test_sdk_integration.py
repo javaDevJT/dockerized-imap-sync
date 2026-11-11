@@ -6,6 +6,7 @@ import io
 import logging
 import json
 import subprocess
+import threading
 import unittest
 import time
 from contextlib import redirect_stderr
@@ -32,17 +33,28 @@ except ImportError:
 
 @unittest.skipUnless(SDK_AVAILABLE, "install telemetry/requirements.lock to run the real-SDK checks")
 class RealSdkIntegrationTests(unittest.TestCase):
-    def _exercise_validation(self, partial_traces: bool = False) -> tuple[dict[str, Any], list[Any], str]:
+    def _exercise_validation(
+        self,
+        partial_traces: bool = False,
+        failing_traces: bool = False,
+        redirect_traces: bool = False,
+        resource_attributes: str | None = None,
+    ) -> tuple[dict[str, Any], list[Any], str]:
         sessions: list[Any] = []
 
         class Response:
-            status_code = 200
-            reason = "OK"
-            text = ""
-            headers: dict[str, str] = {}
-
-            def __init__(self, content: bytes = b"") -> None:
+            def __init__(
+                self,
+                content: bytes = b"",
+                status_code: int = 200,
+                reason: str = "OK",
+                headers: dict[str, str] | None = None,
+            ) -> None:
                 self.content = content
+                self.status_code = status_code
+                self.reason = reason
+                self.text = ""
+                self.headers = headers or {}
 
         class Session:
             def __init__(self) -> None:
@@ -53,6 +65,18 @@ class RealSdkIntegrationTests(unittest.TestCase):
 
             def request(self, method: str, url: str, **kwargs: Any) -> Response:
                 self.requests.append((method, url, kwargs))
+                if failing_traces and url.endswith("/v1/traces"):
+                    return Response(
+                        status_code=503,
+                        reason="private collector response text",
+                        headers={"Retry-After": "0"},
+                    )
+                if redirect_traces and url.endswith("/v1/traces"):
+                    return Response(
+                        status_code=308,
+                        reason="private redirect response text",
+                        headers={"Location": "https://private-collector.invalid/"},
+                    )
                 if partial_traces and url.endswith("/v1/traces"):
                     partial = ExportTraceServiceResponse()
                     partial.partial_success.rejected_spans = 1
@@ -81,7 +105,12 @@ class RealSdkIntegrationTests(unittest.TestCase):
                 patch.object(requests, "Session", Session),
                 redirect_stderr(stderr),
             ):
-                telemetry = runner.build_telemetry("test-ingest-key", {})
+                environ = (
+                    {"OTEL_RESOURCE_ATTRIBUTES": resource_attributes}
+                    if resource_attributes is not None
+                    else {}
+                )
+                telemetry = runner.build_telemetry("test-ingest-key", environ)
                 try:
                     task_runner = runner.Runner(telemetry, popen=lambda _command, **_kwargs: Child())
                     self.assertEqual(task_runner.run_validation(), 0)
@@ -267,6 +296,211 @@ class RealSdkIntegrationTests(unittest.TestCase):
             for metric in scope_metrics.metrics
         }
         self.assertIn("imap_sync.validation.runs", metric_names)
+        self.assertTrue(any(name.startswith("otel.sdk.processor.") for name in metric_names))
+
+    def test_resource_attributes_are_preserved_on_all_signals(self) -> None:
+        _receipt, sessions, _stderr = self._exercise_validation(
+            resource_attributes="host.name=truenas,site.name=home%2Cnas,service.name=override"
+        )
+        requests_seen = [request for session in sessions for request in session.requests]
+        payloads = {
+            url.rsplit("/", 1)[-1]: kwargs["data"]
+            for _method, url, kwargs in requests_seen
+            if url.endswith(("/v1/traces", "/v1/metrics", "/v1/logs"))
+        }
+        resources = {
+            "traces": ExportTraceServiceRequest.FromString(payloads["traces"]).resource_spans[0].resource,
+            "metrics": ExportMetricsServiceRequest.FromString(payloads["metrics"]).resource_metrics[0].resource,
+            "logs": ExportLogsServiceRequest.FromString(payloads["logs"]).resource_logs[0].resource,
+        }
+
+        for resource in resources.values():
+            attributes = {item.key: item.value.string_value for item in resource.attributes}
+            self.assertEqual(attributes["host.name"], "truenas")
+            self.assertEqual(attributes["site.name"], "home,nas")
+            self.assertEqual(attributes["service.name"], "imap-sync")
+
+    def test_processor_queues_are_bounded_and_shutdown_drains_retained_records(self) -> None:
+        class Response:
+            status_code = 200
+            content = b""
+            reason = "OK"
+            headers: dict[str, str] = {}
+
+        started = {signal: threading.Event() for signal in ("traces", "logs")}
+        release = {signal: threading.Event() for signal in ("traces", "logs")}
+        first_request = {signal: True for signal in ("traces", "logs")}
+        requests_seen: list[tuple[str, bytes]] = []
+        request_lock = threading.Lock()
+
+        class Session:
+            def __init__(self) -> None:
+                self.verify: bool | str = True
+                self.cert: Any = None
+
+            def request(self, method: str, url: str, **kwargs: Any) -> Response:
+                signal = next((name for name in started if url.endswith(f"/v1/{name}")), None)
+                if signal is not None:
+                    with request_lock:
+                        requests_seen.append((signal, kwargs["data"]))
+                        block = first_request[signal]
+                        first_request[signal] = False
+                    if block:
+                        started[signal].set()
+                        release[signal].wait(timeout=5)
+                return Response()
+
+            def close(self) -> None:
+                pass
+
+        root_logger = logging.getLogger()
+        exporter_logger = logging.getLogger("opentelemetry.exporter.otlp.proto.http")
+        saved_root_handlers = root_logger.handlers[:]
+        saved_root_level = root_logger.level
+        saved_exporter_handlers = exporter_logger.handlers[:]
+        saved_exporter_level = exporter_logger.level
+        saved_exporter_propagate = exporter_logger.propagate
+        telemetry: runner.Telemetry | None = None
+        try:
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "OTEL_BSP_MAX_QUEUE_SIZE": "1",
+                        "OTEL_BLRP_MAX_QUEUE_SIZE": "1",
+                        "OTEL_PYTHON_SDK_INTERNAL_METRICS_ENABLED": "false",
+                    },
+                    clear=True,
+                ),
+                patch.object(runner, "PROCESSOR_MAX_QUEUE_SIZE", 2),
+                patch.object(runner, "PROCESSOR_MAX_EXPORT_BATCH_SIZE", 1),
+                patch.object(runner, "BATCH_SCHEDULE_DELAY_MILLIS", 60_000),
+                patch.object(requests, "Session", Session),
+            ):
+                try:
+                    telemetry = runner.build_telemetry("test-ingest-key", {})
+                    for index in range(6):
+                        with telemetry.tracer.start_as_current_span(f"trace-{index}"):
+                            pass
+                        if index == 0:
+                            self.assertTrue(started["traces"].wait(timeout=2))
+                        telemetry.logger.info("log-%s", index)
+                        if index == 0:
+                            self.assertTrue(started["logs"].wait(timeout=2))
+                    self.assertEqual(os.environ.get("OTEL_PYTHON_SDK_INTERNAL_METRICS_ENABLED"), "false")
+                finally:
+                    for release_signal in release.values():
+                        release_signal.set()
+                    if telemetry is not None:
+                        telemetry.shutdown()
+        finally:
+            root_logger.handlers[:] = saved_root_handlers
+            root_logger.setLevel(saved_root_level)
+            exporter_logger.handlers[:] = saved_exporter_handlers
+            exporter_logger.setLevel(saved_exporter_level)
+            exporter_logger.propagate = saved_exporter_propagate
+
+        spans = [
+            span.name
+            for signal, payload in requests_seen
+            if signal == "traces"
+            for resource_spans in ExportTraceServiceRequest.FromString(payload).resource_spans
+            for scope_spans in resource_spans.scope_spans
+            for span in scope_spans.spans
+        ]
+        logs = [
+            record.body.string_value
+            for signal, payload in requests_seen
+            if signal == "logs"
+            for resource_logs in ExportLogsServiceRequest.FromString(payload).resource_logs
+            for scope_logs in resource_logs.scope_logs
+            for record in scope_logs.log_records
+        ]
+        self.assertEqual(set(spans), {"trace-0", "trace-4", "trace-5"})
+        self.assertEqual(set(logs), {"log-0", "log-4", "log-5"})
+
+    def test_shutdown_respects_worker_budget_during_blocked_export(self) -> None:
+        class Response:
+            status_code = 200
+            content = b""
+            reason = "OK"
+            headers: dict[str, str] = {}
+
+        started = threading.Event()
+        release = threading.Event()
+        request_finished = threading.Event()
+        provider_shutdown_finished = threading.Event()
+
+        class Session:
+            def __init__(self) -> None:
+                self.verify: bool | str = True
+                self.cert: Any = None
+
+            def request(self, method: str, url: str, **_kwargs: Any) -> Response:
+                if url.endswith("/v1/traces"):
+                    started.set()
+                    release.wait(timeout=5)
+                    request_finished.set()
+                return Response()
+
+            def close(self) -> None:
+                pass
+
+        root_logger = logging.getLogger()
+        exporter_logger = logging.getLogger("opentelemetry.exporter.otlp.proto.http")
+        saved_root_handlers = root_logger.handlers[:]
+        saved_root_level = root_logger.level
+        saved_exporter_handlers = exporter_logger.handlers[:]
+        saved_exporter_level = exporter_logger.level
+        saved_exporter_propagate = exporter_logger.propagate
+        telemetry: runner.Telemetry | None = None
+        try:
+            with (
+                patch.dict(
+                    os.environ,
+                    {"OTEL_PYTHON_SDK_INTERNAL_METRICS_ENABLED": "false"},
+                    clear=True,
+                ),
+                patch.object(runner, "PROCESSOR_SHUTDOWN_TIMEOUT_MS", 100),
+                patch.object(runner, "PROCESSOR_MAX_EXPORT_BATCH_SIZE", 1),
+                patch.object(runner, "BATCH_SCHEDULE_DELAY_MILLIS", 60_000),
+                patch.object(requests, "Session", Session),
+            ):
+                try:
+                    telemetry = runner.build_telemetry("test-ingest-key", {})
+                    trace_provider = dict(telemetry.providers)["traces"]
+                    original_shutdown = trace_provider.shutdown
+
+                    def tracked_shutdown(*args: Any, **kwargs: Any) -> Any:
+                        try:
+                            return original_shutdown(*args, **kwargs)
+                        finally:
+                            provider_shutdown_finished.set()
+
+                    trace_provider.shutdown = tracked_shutdown
+                    with telemetry.tracer.start_as_current_span("blocked-before-shutdown"):
+                        pass
+                    self.assertTrue(started.wait(timeout=2))
+                    shutdown_started = time.monotonic()
+                    telemetry.shutdown()
+                    shutdown_elapsed = time.monotonic() - shutdown_started
+                    telemetry = None
+                    self.assertLess(shutdown_elapsed, 1.5)
+                    self.assertFalse(request_finished.is_set())
+                    release.set()
+                    self.assertTrue(request_finished.wait(timeout=2))
+                    self.assertTrue(provider_shutdown_finished.wait(timeout=2))
+                finally:
+                    release.set()
+                    if telemetry is not None:
+                        telemetry.shutdown()
+                        provider_shutdown_finished.wait(timeout=2)
+        finally:
+            root_logger.handlers[:] = saved_root_handlers
+            root_logger.setLevel(saved_root_level)
+            exporter_logger.handlers[:] = saved_exporter_handlers
+            exporter_logger.setLevel(saved_exporter_level)
+            exporter_logger.propagate = saved_exporter_propagate
 
     def test_real_sdk_partial_success_fails_validation_receipt(self) -> None:
         receipt, _sessions, stderr = self._exercise_validation(partial_traces=True)
@@ -274,8 +508,52 @@ class RealSdkIntegrationTests(unittest.TestCase):
         self.assertEqual(receipt["outcome"], "failure")
         self.assertEqual(receipt["exports"]["traces"]["status"], "partial")
         self.assertEqual(receipt["exports"]["traces"]["partial_successes"], 1)
+        self.assertEqual(receipt["exports"]["traces"]["rejected_items"], 1)
         self.assertIn("telemetry exporter reported an issue signal=traces", stderr)
         self.assertNotIn("private server response text", stderr)
+
+    def test_real_sdk_permanent_collector_failure_uses_bounded_retries(self) -> None:
+        from opentelemetry.exporter.otlp.common.http import _OTLPHTTPClient
+
+        with patch.object(_OTLPHTTPClient, "_compute_backoff", return_value=0.0):
+            receipt, sessions, stderr = self._exercise_validation(failing_traces=True)
+
+        trace_requests = [
+            (url, kwargs)
+            for session in sessions
+            for _method, url, kwargs in session.requests
+            if url.endswith("/v1/traces")
+        ]
+        self.assertEqual(receipt["outcome"], "failure")
+        self.assertEqual(receipt["exports"]["traces"]["status"], "failure")
+        self.assertEqual(receipt["exports"]["traces"]["attempts"], 1)
+        self.assertEqual(receipt["exports"]["traces"]["failures"], 1)
+        self.assertEqual(len(trace_requests), 6)
+        self.assertTrue(
+            all(0 < kwargs["timeout"] <= runner.EXPORT_TIMEOUT_SECONDS for _, kwargs in trace_requests)
+        )
+        self.assertEqual(receipt["exports"]["metrics"]["status"], "success")
+        self.assertEqual(receipt["exports"]["logs"]["status"], "success")
+        self.assertIn("telemetry exporter reported an issue signal=traces", stderr)
+        self.assertNotIn("private collector response text", stderr)
+
+    def test_real_sdk_redirect_is_reported_as_export_failure(self) -> None:
+        receipt, sessions, stderr = self._exercise_validation(redirect_traces=True)
+
+        trace_requests = [
+            (url, kwargs)
+            for session in sessions
+            for _method, url, kwargs in session.requests
+            if url.endswith("/v1/traces")
+        ]
+        self.assertEqual(receipt["outcome"], "failure")
+        self.assertEqual(receipt["exports"]["traces"]["status"], "failure")
+        self.assertEqual(receipt["exports"]["traces"]["failures"], 1)
+        self.assertEqual(len(trace_requests), 1)
+        self.assertIs(trace_requests[0][1]["allow_redirects"], False)
+        self.assertIn("telemetry exporter reported an issue signal=traces", stderr)
+        self.assertNotIn("private redirect response text", stderr)
+        self.assertNotIn("private-collector.invalid", stderr)
 
     def test_real_sdk_exports_child_request_client_span_and_sanitized_logs(self) -> None:
         receipt, sessions, stdout, stderr = self._exercise_sync()
@@ -351,6 +629,16 @@ class RealSdkIntegrationTests(unittest.TestCase):
         self.assertEqual(summary_attributes["malformed_events"].int_value, 0)
         self.assertEqual(summary_attributes["export_failures"].int_value, 0)
         self.assertEqual(summary_attributes["partial_successes"].int_value, 0)
+        self.assertEqual(summary_attributes["rejected_items"].int_value, 0)
+        for signal_name in ("traces", "metrics", "logs"):
+            self.assertEqual(
+                summary_attributes[f"otel.exporter.{signal_name}.partial_successes"].int_value,
+                0,
+            )
+            self.assertEqual(
+                summary_attributes[f"otel.exporter.{signal_name}.rejected_items"].int_value,
+                0,
+            )
         self.assertEqual(json.loads(summary_attributes["command_counts"].string_value), {"UID FETCH": 1})
         self.assertEqual(
             [item.string_value for item in summary_attributes["server_addresses"].array_value.values],
