@@ -1,0 +1,53 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended"
+  ],
+  "timezone": "America/Puerto_Rico",
+  "schedule": [
+    "* 22-23,0-2 * * *"
+  ],
+  "automergeSchedule": [
+    "* 22-23,0-2 * * *"
+  ],
+  "updateNotScheduled": false,
+  "prConcurrentLimit": 2,
+  "prHourlyLimit": 1,
+  "commitHourlyLimit": 2,
+  "minimumReleaseAge": "3 days",
+  "platformAutomerge": false,
+  "automergeType": "pr",
+  "automergeStrategy": "squash",
+  "automerge": false,
+  "ignoreTests": false,
+  "internalChecksAsSuccess": false,
+  "vulnerabilityAlerts": {
+    "enabled": false
+  },
+  "packageRules": [
+    {
+      "description": "Application images are advanced by the existing verified release workflow",
+      "matchDatasources": [
+        "docker"
+      ],
+      "matchPackageNames": [
+        "ghcr.io/javadevjt/**"
+      ],
+      "enabled": false
+    },
+    {
+      "description": "Automerge tested dependencies through the protected GitHub CI check",
+      "matchManagers": [
+        "dockerfile"
+      ],
+      "matchFileNames": [
+        "Dockerfile"
+      ],
+      "matchUpdateTypes": [
+        "digest",
+        "patch"
+      ],
+      "automerge": true
+    }
+  ]
+}
