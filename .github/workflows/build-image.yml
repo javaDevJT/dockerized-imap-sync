@@ -67,6 +67,7 @@ jobs:
           outputs: ${{ steps.container_security_pr.outputs.exporter }}
           context: .
           file: ./Dockerfile
+          no-cache-filters: runtime
           build-args: |
             QB_SOURCE_COMMIT=${{ github.event.pull_request.head.sha }}
             BUILD_REVISION=${{ github.event.pull_request.head.sha }}
@@ -168,6 +169,7 @@ jobs:
             type=local,src=${{ steps.ci_disk_cache_1.outputs.from }}
           cache-to: ${{ steps.ci_disk_cache_1.outputs.to && format('type=local,dest={0},mode=max,ignore-error=true', steps.ci_disk_cache_1.outputs.to) || '' }}
           context: .
+          no-cache-filters: runtime
           build-args: |
             QB_SOURCE_COMMIT=${{ github.sha }}
             BUILD_REVISION=${{ github.sha }}
