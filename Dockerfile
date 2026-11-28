@@ -33,7 +33,7 @@ RUN abuild-keygen -a -n \
        python3 -m pip install --no-cache-dir --no-compile --require-hashes \
         --target /python-packages -r /src/requirements.lock
 
-FROM ${ALPINE_IMAGE}
+FROM ${ALPINE_IMAGE} AS runtime
 
 COPY --from=zlib-build /etc/apk/keys/ /etc/apk/keys/
 COPY --from=zlib-build /zlib-ng-compat.apk /tmp/zlib-ng-compat.apk
